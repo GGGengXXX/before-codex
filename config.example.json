@@ -1,0 +1,89 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "public_api_key": "env:RELAY_API_KEY",
+    "admin_api_key": "env:RELAY_ADMIN_KEY",
+    "request_timeout_ms": 120000,
+    "max_body_bytes": 10485760
+  },
+  "state": {
+    "store": "file",
+    "file_path": ".codex-relay-state.json",
+    "lock_timeout_ms": 1000,
+    "stale_lock_ms": 5000
+  },
+  "routing": {
+    "max_attempts": 4,
+    "max_provider_fallbacks": 2,
+    "retry_backoff_ms": 250,
+    "affinity_ttl_ms": 86400000,
+    "compatibility": {
+      "sanitize_request_items": true,
+      "sanitize_response_items": true,
+      "drop_invalid_reasoning_items": true,
+      "strip_invalid_request_item_ids": true
+    },
+    "provider_error_rules": {
+      "provider-a": {
+        "billing_statuses": [402],
+        "billing_codes": ["insufficient_quota", "credits_depleted"],
+        "billing_messages": ["balance is insufficient"],
+        "rate_limit_statuses": [429],
+        "auth_statuses": [401, 403],
+        "transient_statuses": [408, 500, 502, 503, 504],
+        "non_retryable_statuses": [400, 404, 422]
+      },
+      "provider-b": {
+        "billing_codes": ["quota_exhausted"],
+        "rate_limit_messages": ["too many requests"]
+      }
+    },
+    "cooldowns": {
+      "rate_limited_ms": 10000,
+      "transient_ms": 30000,
+      "auth_ms": 3600000,
+      "billing_ms": 3600000
+    }
+  },
+  "models": {
+    "codex": {
+      "aliases": [
+        "gpt-5-codex",
+        "gpt-5.1-codex"
+      ],
+      "deployments": [
+        {
+          "id": "provider-a-key-1",
+          "provider": "provider-a",
+          "base_url": "https://api-a.example.com/v1",
+          "model": "gpt-5-codex",
+          "api_key": "env:UPSTREAM_A_KEY_1",
+          "priority": 10,
+          "weight": 1,
+          "enabled": true
+        },
+        {
+          "id": "provider-a-key-2",
+          "provider": "provider-a",
+          "base_url": "https://api-a.example.com/v1",
+          "model": "gpt-5-codex",
+          "api_key": "env:UPSTREAM_A_KEY_2",
+          "priority": 10,
+          "weight": 1,
+          "enabled": true
+        },
+        {
+          "id": "provider-b-key-1",
+          "provider": "provider-b",
+          "base_url": "https://api-b.example.com/v1",
+          "model": "gpt-5-codex",
+          "api_key": "env:UPSTREAM_B_KEY_1",
+          "priority": 20,
+          "weight": 1,
+          "enabled": true
+        }
+      ]
+    }
+  }
+}

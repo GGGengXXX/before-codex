@@ -1,0 +1,16 @@
+{
+  "name": "codex-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A small OpenAI Responses-compatible relay with multi-key and multi-endpoint failover.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test",
+    "check": "node --check src/index.js && for file in src/*.js test/*.test.js; do node --check \"$file\"; done"
+  }
+}
