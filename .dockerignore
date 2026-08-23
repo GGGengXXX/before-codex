@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log*
+.env
+.env.*
+!.env.example
+config.json
+config.*.json
+!config.example.json
+.git
+.gitignore
+.codex-relay-state.json
+.codex-relay-state.json.raw/
+README.md
+docs
+test
+scripts

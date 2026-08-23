@@ -22,7 +22,9 @@
       "sanitize_request_items": true,
       "sanitize_response_items": true,
       "drop_invalid_reasoning_items": true,
-      "strip_invalid_request_item_ids": true
+      "strip_invalid_request_item_ids": true,
+      "strip_invalid_response_item_ids": true,
+      "convert_dsml_tool_calls": true
     },
     "provider_error_rules": {
       "provider-a": {

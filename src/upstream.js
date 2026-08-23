@@ -47,9 +47,147 @@ function abortSignalFor(request, response, timeoutMs) {
 }
 
 const INVALID_REASONING_TYPES = new Set(["reasoning", "compaction"]);
+const DSML_TOOL_CALLS_OPEN = "<\uFF5C\uFF5CDSML\uFF5C\uFF5Ctool_calls>";
+const DSML_TOOL_CALLS_CLOSE = "</\uFF5C\uFF5CDSML\uFF5C\uFF5Ctool_calls>";
+const DSML_INVOKE_OPEN = "<\uFF5C\uFF5CDSML\uFF5C\uFF5Cinvoke";
+const DSML_INVOKE_CLOSE = "</\uFF5C\uFF5CDSML\uFF5C\uFF5Cinvoke>";
+const DSML_PARAMETER_OPEN = "<\uFF5C\uFF5CDSML\uFF5C\uFF5Cparameter";
+const DSML_PARAMETER_CLOSE = "</\uFF5C\uFF5CDSML\uFF5C\uFF5Cparameter>";
 
 function compatibilityEnabled(compatibility, key) {
   return compatibility?.[key] !== false;
+}
+
+function decodeXmlText(value) {
+  return String(value)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#([0-9]+);/g, (_, code) => String.fromCodePoint(Number(code)));
+}
+
+function parseDsmlToolCalls(text) {
+  if (typeof text !== "string") {
+    return null;
+  }
+  const openIndex = text.indexOf(DSML_TOOL_CALLS_OPEN);
+  if (openIndex < 0 || !text.includes(DSML_TOOL_CALLS_CLOSE, openIndex)) {
+    return null;
+  }
+  const closeIndex = text.indexOf(DSML_TOOL_CALLS_CLOSE, openIndex);
+  const block = text.slice(openIndex + DSML_TOOL_CALLS_OPEN.length, closeIndex);
+  const calls = [];
+  const invokePattern = new RegExp(
+    `${DSML_INVOKE_OPEN}\\s+name=(?:"([^"]+)"|'([^']+)')[^>]*>([\\s\\S]*?)${DSML_INVOKE_CLOSE}`,
+    "g"
+  );
+  for (const match of block.matchAll(invokePattern)) {
+    const name = match[1] || match[2];
+    const parameters = {};
+    const parameterPattern = new RegExp(
+      `${DSML_PARAMETER_OPEN}\\s+name=(?:"([^"]+)"|'([^']+)')[^>]*>([\\s\\S]*?)${DSML_PARAMETER_CLOSE}`,
+      "g"
+    );
+    for (const parameter of match[3].matchAll(parameterPattern)) {
+      parameters[parameter[1] || parameter[2]] = decodeXmlText(parameter[3]);
+    }
+    calls.push({ name, arguments: JSON.stringify(parameters) });
+  }
+  if (calls.length === 0) {
+    return null;
+  }
+  return {
+    visibleText: `${text.slice(0, openIndex)}${text.slice(closeIndex + DSML_TOOL_CALLS_CLOSE.length)}`.trim(),
+    calls
+  };
+}
+
+function textWithDsmlCalls(value) {
+  return extractOutputTextFromJson(value);
+}
+
+function responseTarget(value) {
+  return value?.response && typeof value.response === "object" ? value.response : value;
+}
+
+function declaredToolNames(requestBody) {
+  return new Set((requestBody?.tools || [])
+    .map((tool) => tool?.name || tool?.function?.name)
+    .filter((name) => typeof name === "string"));
+}
+
+function adaptDsmlCall(call, requestBody) {
+  const declared = declaredToolNames(requestBody);
+  if (declared.has(call.name)) {
+    return call;
+  }
+  if (call.name !== "exec" || (declared.size > 0 && !declared.has("exec_command"))) {
+    return call;
+  }
+  let argumentsText = call.arguments;
+  try {
+    const argumentsValue = JSON.parse(argumentsText);
+    if (Object.hasOwn(argumentsValue, "input") && !Object.hasOwn(argumentsValue, "cmd")) {
+      argumentsValue.cmd = argumentsValue.input;
+      delete argumentsValue.input;
+      argumentsText = JSON.stringify(argumentsValue);
+    }
+  } catch {
+    // Keep the original arguments if the provider emitted non-JSON values.
+  }
+  return { ...call, name: "exec_command", arguments: argumentsText };
+}
+
+function addFunctionCallsToOutput(output, parsed, requestId, requestBody) {
+  const calls = parsed.calls.map((rawCall, index) => {
+    const call = adaptDsmlCall(rawCall, requestBody);
+    const suffix = String(requestId || "relay").replace(/[^A-Za-z0-9]/g, "").slice(-24) || "relay";
+    const id = `fc_${suffix}_${index + 1}`;
+    return {
+      type: "function_call",
+      id,
+      call_id: `call_${suffix}_${index + 1}`,
+      name: call.name,
+      arguments: call.arguments,
+      status: "completed"
+    };
+  });
+  return [...(Array.isArray(output) ? output : []), ...calls];
+}
+
+export function convertDsmlToolCalls(value, compatibility = {}, requestId = "relay", requestBody = null) {
+  if (!compatibilityEnabled(compatibility, "convert_dsml_tool_calls") || !value || typeof value !== "object") {
+    return value;
+  }
+  const text = textWithDsmlCalls(value);
+  const parsed = parseDsmlToolCalls(text);
+  if (!parsed) {
+    return value;
+  }
+  const target = responseTarget(value);
+  const converted = { ...value };
+  const convertedTarget = target === value ? converted : { ...target };
+  if (parsed.visibleText) {
+    convertedTarget.output_text = parsed.visibleText;
+  } else {
+    delete convertedTarget.output_text;
+  }
+  convertedTarget.output = addFunctionCallsToOutput(
+    parsed.visibleText
+      ? [{ type: "message", role: "assistant", content: [{ type: "output_text", text: parsed.visibleText }] }]
+      : [],
+    parsed,
+    requestId,
+    requestBody
+  );
+  if (target === value) {
+    return convertedTarget;
+  }
+  converted.response = convertedTarget;
+  return converted;
 }
 
 export function compatibilityForDeployment(config, deployment) {
@@ -150,11 +288,14 @@ export function sanitizeRequestBody(body, compatibility = {}) {
   return sanitized;
 }
 
-export function sanitizeResponsePayload(value, compatibility = {}) {
+export function sanitizeResponsePayload(value, compatibility = {}, requestId = "relay", requestBody = null) {
   if (!compatibilityEnabled(compatibility, "sanitize_response_items")) {
     return value;
   }
-  const sanitized = sanitizeResponsesValue(value, compatibility);
+  const converted = convertDsmlToolCalls(value, compatibility, requestId, requestBody);
+  const sanitized = sanitizeResponsesValue(converted, compatibility, {
+    stripRequestIds: compatibilityEnabled(compatibility, "strip_invalid_response_item_ids")
+  });
   return sanitized === DROP_ITEM ? null : sanitized;
 }
 
@@ -170,7 +311,7 @@ function splitSseEvent(buffer) {
   };
 }
 
-function sanitizeSseEvent(event, compatibility) {
+function sanitizeSseEvent(event, compatibility, requestId = "relay", requestBody = null) {
   if (!compatibilityEnabled(compatibility, "sanitize_response_items")) {
     return event;
   }
@@ -192,7 +333,7 @@ function sanitizeSseEvent(event, compatibility) {
   } catch {
     return event;
   }
-  const sanitized = sanitizeResponsePayload(parsed, compatibility);
+  const sanitized = sanitizeResponsePayload(parsed, compatibility, requestId, requestBody);
   if (sanitized === null) {
     return "";
   }
@@ -200,8 +341,89 @@ function sanitizeSseEvent(event, compatibility) {
   return `${nonDataLines.join("\n")}${nonDataLines.length ? "\n" : ""}data: ${JSON.stringify(sanitized)}\n\n`;
 }
 
-export function createSseSanitizer(compatibility = {}) {
+function sseEventPayload(event) {
+  const data = event.split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).replace(/^ /, ""))
+    .join("\n")
+    .trim();
+  if (!data || data === "[DONE]") return null;
+  try { return JSON.parse(data); } catch { return null; }
+}
+
+function sseDeltaText(value) {
+  if (!value || typeof value !== "object") return "";
+  if (typeof value.delta === "string") return value.delta;
+  if (typeof value.text === "string" && String(value.type || "").includes("text")) return value.text;
+  return typeof value.choices?.[0]?.delta?.content === "string"
+    ? value.choices[0].delta.content
+    : "";
+}
+
+function dsmlToolCallSse({ calls, visibleText, responseId, requestId, usage, requestBody }) {
+  const events = [];
+  if (visibleText) {
+    events.push(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: visibleText })}\n\n`);
+  }
+  const suffix = String(requestId || "relay").replace(/[^A-Za-z0-9]/g, "").slice(-24) || "relay";
+  const output = calls.map((rawCall, index) => {
+    const call = adaptDsmlCall(rawCall, requestBody);
+    const id = `fc_${suffix}_${index + 1}`;
+    const item = { type: "function_call", id, call_id: `call_${suffix}_${index + 1}`, name: call.name, arguments: call.arguments, status: "completed" };
+    events.push(`event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: index, item: { ...item, arguments: "" } })}\n\n`);
+    events.push(`event: response.function_call_arguments.delta\ndata: ${JSON.stringify({ type: "response.function_call_arguments.delta", item_id: id, output_index: index, delta: call.arguments })}\n\n`);
+    events.push(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", item_id: id, output_index: index, arguments: call.arguments })}\n\n`);
+    events.push(`event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: index, item })}\n\n`);
+    return item;
+  });
+  events.push(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: responseId, object: "response", status: "completed", output, ...(usage ? { usage } : {}) } })}\n\n`);
+  return events.join("");
+}
+
+export function createSseSanitizer(compatibility = {}, requestId = "relay", requestBody = null) {
   let buffer = "";
+  let pending = [];
+  let pendingText = "";
+  let dsmlDetected = false;
+  const marker = DSML_TOOL_CALLS_OPEN;
+  const flushPending = () => {
+    const output = pending.join("");
+    pending = [];
+    pendingText = "";
+    return output;
+  };
+  const convertPending = () => {
+    const parsed = parseDsmlToolCalls(pendingText);
+    if (!parsed) return flushPending();
+    const responseId = extractResponseIdFromSse(pending.join("")) || `resp_${String(requestId).replace(/[^A-Za-z0-9]/g, "") || "relay"}`;
+    const usage = extractUsageFromSse(pending.join(""));
+    pending = [];
+    pendingText = "";
+    dsmlDetected = false;
+    return dsmlToolCallSse({ calls: parsed.calls, visibleText: parsed.visibleText, responseId, requestId, usage, requestBody });
+  };
+  const processEvent = (event) => {
+    const sanitized = sanitizeSseEvent(event, compatibility, requestId, requestBody);
+    if (!sanitized) return "";
+    const payload = sseEventPayload(sanitized);
+    const delta = sseDeltaText(payload);
+    if (!dsmlDetected && (pendingText || delta).includes(marker)) {
+      dsmlDetected = true;
+    }
+    if (dsmlDetected || (delta && marker.startsWith((pendingText + delta).slice(-marker.length)))) {
+      pending.push(sanitized);
+      pendingText += delta;
+      if (dsmlDetected && (sseHasTerminalEvent(sanitized) || sseHasDoneMarker(sanitized))) {
+        return convertPending();
+      }
+      return "";
+    }
+    if (pending.length) {
+      const before = flushPending();
+      return before + sanitized;
+    }
+    return sanitized;
+  };
   return {
     push(chunk) {
       buffer += chunk;
@@ -211,24 +433,27 @@ export function createSseSanitizer(compatibility = {}) {
         if (!next) {
           break;
         }
-        output += sanitizeSseEvent(next.event, compatibility);
+        output += processEvent(next.event);
         buffer = next.rest;
       }
       return output;
     },
     flush() {
       if (!buffer) {
-        return "";
+        return dsmlDetected ? convertPending() : flushPending();
       }
-      const output = sanitizeSseEvent(buffer, compatibility);
+      const output = processEvent(buffer);
       buffer = "";
-      return output;
+      return output + (dsmlDetected ? convertPending() : flushPending());
     }
   };
 }
 
 export function requestBodyForDeployment(body, deployment, compatibility = {}) {
   const rewritten = { ...sanitizeRequestBody(body, compatibility), model: deployment.model };
+  if (compatibility?.strip_previous_response_id === true) {
+    delete rewritten.previous_response_id;
+  }
   return JSON.stringify(rewritten);
 }
 
@@ -332,8 +557,20 @@ export function extractOutputTextFromJson(value) {
   if (typeof value.response?.output_text === "string") {
     return value.response.output_text;
   }
+  if (Array.isArray(value.response?.output)) {
+    return value.response.output
+      .map((item) => textFromContent(item.content))
+      .filter(Boolean)
+      .join("");
+  }
   if (typeof value.choices?.[0]?.message?.content === "string") {
     return value.choices[0].message.content;
+  }
+  if (typeof value.choices?.[0]?.delta?.content === "string") {
+    return value.choices[0].delta.content;
+  }
+  if (value.item && typeof value.item === "object") {
+    return textFromContent(value.item.content);
   }
   if (Array.isArray(value.output)) {
     return value.output
@@ -378,14 +615,75 @@ export function extractOutputTextFromSse(text) {
       const value = JSON.parse(payload);
       output += value.delta
         ?? value.text
+        ?? value.choices?.[0]?.delta?.content
         ?? value.output_text
         ?? value.response?.output_text
+        ?? extractOutputTextFromJson(value)
         ?? "";
     } catch {
       // SSE chunks can contain partial JSON while the stream is in flight.
     }
   }
   return output;
+}
+
+export function extractOutputTextDeltaFromSse(text) {
+  let output = "";
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) {
+      continue;
+    }
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") {
+      continue;
+    }
+    try {
+      const value = JSON.parse(payload);
+      if (value.type === "response.output_text.delta" && typeof value.delta === "string") {
+        output += value.delta;
+      } else if (typeof value.choices?.[0]?.delta?.content === "string") {
+        output += value.choices[0].delta.content;
+      }
+    } catch {
+      // Ignore incomplete SSE JSON while the stream is in flight.
+    }
+  }
+  return output;
+}
+
+// Some Responses-compatible providers omit output_text.delta and only emit the
+// completed message item or the final response object. Keep these fallbacks
+// separate from deltas so the server can avoid counting the same text twice.
+export function extractOutputTextPartsFromSse(text) {
+  let deltaText = "";
+  let itemText = "";
+  let completedText = "";
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith("data:")) {
+      continue;
+    }
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") {
+      continue;
+    }
+    try {
+      const value = JSON.parse(payload);
+      if (value.type === "response.output_text.delta" && typeof value.delta === "string") {
+        deltaText += value.delta;
+      } else if (typeof value.choices?.[0]?.delta?.content === "string") {
+        deltaText += value.choices[0].delta.content;
+      } else if (value.type === "response.output_text.done" && typeof value.text === "string") {
+        itemText += value.text;
+      } else if (value.type === "response.output_item.added" || value.type === "response.output_item.done") {
+        itemText += extractOutputTextFromJson(value);
+      } else if (value.type === "response.completed" || value.type === "response.done") {
+        completedText = extractOutputTextFromJson(value.response ?? value) || completedText;
+      }
+    } catch {
+      // Ignore incomplete SSE JSON while the stream is in flight.
+    }
+  }
+  return { deltaText, itemText, completedText };
 }
 
 export function extractResponseIdFromSse(text) {
@@ -416,8 +714,52 @@ export function sseHasTerminalEvent(text) {
   return (
     /(?:^|\r?\n)event:\s*response\.(?:completed|failed|incomplete)\s*(?:\r?\n|$)/m.test(text)
     || /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(text)
-    || /(?:^|\r?\n)data:\s*\[DONE\]\s*(?:\r?\n|$)/m.test(text)
   );
+}
+
+export function sseHasDoneMarker(text) {
+  return /(?:^|\r?\n)data:\s*\[DONE\]\s*(?:\r?\n|$)/m.test(text);
+}
+
+export function synthesizeResponseCompletedSse({ responseId, requestId, outputText, usage } = {}) {
+  const fallbackId = `resp_${String(requestId ?? "relay").replace(/[^A-Za-z0-9]/g, "")}`;
+  const response = {
+    id: responseId || fallbackId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    output: outputText
+      ? [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: outputText }]
+        }]
+      : [],
+    usage: usage ?? null
+  };
+  return `event: response.completed\ndata: ${JSON.stringify({
+    type: "response.completed",
+    response
+  })}\n\n`;
+}
+
+export function synthesizeResponseFailedSse({ responseId, requestId, message, code = "upstream_stream_interrupted" } = {}) {
+  const fallbackId = `resp_${String(requestId ?? "relay").replace(/[^A-Za-z0-9]/g, "")}`;
+  const response = {
+    id: responseId || fallbackId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "failed",
+    error: {
+      code,
+      message: message || "Upstream stream ended before a terminal Responses event."
+    },
+    output: []
+  };
+  return `event: response.failed\ndata: ${JSON.stringify({
+    type: "response.failed",
+    response
+  })}\n\n`;
 }
 
 export async function readText(response, maxBytes = 10 * 1024 * 1024) {

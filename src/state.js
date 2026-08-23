@@ -3,10 +3,12 @@ import path from "node:path";
 
 const RECENT_CALL_LIMIT = 500;
 const USAGE_RETENTION_DAYS = 370;
+const CHARS_PER_ESTIMATED_TOKEN = 4;
+const MIN_ESTIMATED_INPUT_TOKENS = 1;
 
 function emptyStateData() {
   return {
-    version: 1,
+    version: 2,
     deployments: {},
     affinity: {},
     cursors: {},
@@ -29,14 +31,19 @@ function defaultDeploymentState() {
       requests: 0,
       input_tokens: 0,
       output_tokens: 0,
-      total_tokens: 0
+      total_tokens: 0,
+      estimated_requests: 0,
+      estimated_input_tokens: 0,
+      estimated_output_tokens: 0,
+      estimated_total_tokens: 0
     }
   };
 }
 
 function normalizeData(value) {
   const data = value && typeof value === "object" ? value : emptyStateData();
-  data.version = 1;
+  const previousVersion = Number(data.version) || 1;
+  data.version = 2;
   data.deployments = data.deployments && typeof data.deployments === "object"
     ? data.deployments
     : {};
@@ -46,12 +53,28 @@ function normalizeData(value) {
   data.daily_usage = data.daily_usage && typeof data.daily_usage === "object"
     ? data.daily_usage
     : {};
+  if (previousVersion < 2) {
+    migrateEstimatedUsage(data);
+  }
   return data;
 }
 
 function ensureDeploymentState(data, deploymentId) {
   data.deployments[deploymentId] ??= defaultDeploymentState();
-  data.deployments[deploymentId].token_usage ??= defaultDeploymentState().token_usage;
+  const tokenUsage = data.deployments[deploymentId].token_usage ?? {};
+  for (const key of [
+    "requests",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "estimated_requests",
+    "estimated_input_tokens",
+    "estimated_output_tokens",
+    "estimated_total_tokens"
+  ]) {
+    tokenUsage[key] ??= 0;
+  }
+  data.deployments[deploymentId].token_usage = tokenUsage;
   data.deployments[deploymentId].last_request ??= null;
   return data.deployments[deploymentId];
 }
@@ -67,11 +90,120 @@ function deploymentAvailable(data, deployment, now = Date.now()) {
   return true;
 }
 
+function credentialConfigured(deployment) {
+  const apiKey = String(deployment?.api_key ?? "");
+  return Boolean(
+    apiKey
+    && apiKey !== "missing-user-api-key"
+    && !apiKey.startsWith("missing-env:")
+    && !apiKey.startsWith("secret:deployment:")
+  );
+}
+
 function clippedText(value, limit = 4000) {
   if (typeof value !== "string" || !value) {
     return "";
   }
   return value.length > limit ? `${value.slice(0, limit)}...` : value;
+}
+
+function estimateTokensFromText(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return 0;
+  }
+  return Math.max(1, Math.ceil(value.length / CHARS_PER_ESTIMATED_TOKEN));
+}
+
+function looksOpaqueText(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const text = value.trim();
+  if (text.length < 128 || /\s/.test(text)) {
+    return false;
+  }
+  return /^[A-Za-z0-9+/=_-]+$/.test(text);
+}
+
+function usageWithEstimate(usage, metadata = {}) {
+  if (usage?.total_tokens) {
+    return { ...usage, estimated: usage.estimated === true };
+  }
+  const opaqueResponse = metadata.response_text_is_stream_delta === true
+    ? false
+    : looksOpaqueText(metadata.response_text);
+  const outputTokens = opaqueResponse
+    ? 0
+    : estimateTokensFromText(metadata.response_text);
+  const inputTokens = Math.max(
+    MIN_ESTIMATED_INPUT_TOKENS,
+    estimateTokensFromText(metadata.request_text)
+  );
+  if (!outputTokens && !inputTokens) {
+    return null;
+  }
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: inputTokens + outputTokens,
+    estimated: true,
+    estimated_reason: opaqueResponse
+      ? "upstream_usage_missing_opaque_response"
+      : "upstream_usage_missing"
+  };
+}
+
+function addEstimatedUsageToBucket(bucket, usage) {
+  bucket.input_tokens = (bucket.input_tokens ?? 0) + (usage.input_tokens ?? 0);
+  bucket.output_tokens = (bucket.output_tokens ?? 0) + (usage.output_tokens ?? 0);
+  bucket.total_tokens = (bucket.total_tokens ?? 0) + (usage.total_tokens ?? 0);
+  bucket.estimated_calls = (bucket.estimated_calls ?? 0) + 1;
+  bucket.estimated_input_tokens =
+    (bucket.estimated_input_tokens ?? 0) + (usage.input_tokens ?? 0);
+  bucket.estimated_output_tokens =
+    (bucket.estimated_output_tokens ?? 0) + (usage.output_tokens ?? 0);
+  bucket.estimated_total_tokens =
+    (bucket.estimated_total_tokens ?? 0) + (usage.total_tokens ?? 0);
+}
+
+function migrateEstimatedUsage(data) {
+  const deploymentStates = data.deployments;
+  for (const call of data.recent_calls) {
+    if (call.result !== "success" || call.usage) {
+      continue;
+    }
+    const usage = usageWithEstimate(null, {
+      response_text: call.response_text,
+      request_text: ""
+    });
+    if (!usage) {
+      continue;
+    }
+    call.usage = usage;
+    const deploymentState = deploymentStates[call.deployment_id];
+    if (deploymentState) {
+      const tokenUsage = deploymentState.token_usage ?? {};
+      tokenUsage.estimated_requests = (tokenUsage.estimated_requests ?? 0) + 1;
+      tokenUsage.estimated_input_tokens =
+        (tokenUsage.estimated_input_tokens ?? 0) + usage.input_tokens;
+      tokenUsage.estimated_output_tokens =
+        (tokenUsage.estimated_output_tokens ?? 0) + usage.output_tokens;
+      tokenUsage.estimated_total_tokens =
+        (tokenUsage.estimated_total_tokens ?? 0) + usage.total_tokens;
+      tokenUsage.input_tokens = (tokenUsage.input_tokens ?? 0) + usage.input_tokens;
+      tokenUsage.output_tokens = (tokenUsage.output_tokens ?? 0) + usage.output_tokens;
+      tokenUsage.total_tokens = (tokenUsage.total_tokens ?? 0) + usage.total_tokens;
+      deploymentState.token_usage = tokenUsage;
+    }
+    const key = typeof call.at === "string" ? call.at.slice(0, 10) : dayKey();
+    const bucket = ensureUsageBucket(data, key);
+    bucket.calls = bucket.calls ?? 0;
+    bucket.models ??= {};
+    addEstimatedUsageToBucket(bucket, usage);
+    const model = call.upstream_model ?? "unknown";
+    bucket.models[model] ??= emptyUsageBucket();
+    addEstimatedUsageToBucket(bucket.models[model], usage);
+  }
 }
 
 function dayKey(date = new Date()) {
@@ -85,6 +217,10 @@ function emptyUsageBucket() {
     input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
+    estimated_calls: 0,
+    estimated_input_tokens: 0,
+    estimated_output_tokens: 0,
+    estimated_total_tokens: 0,
     latency_ms: 0,
     latency_count: 0,
     models: {}
@@ -103,6 +239,12 @@ function addUsage(target, usage, durationMs, { failed = false } = {}) {
   target.input_tokens += usage?.input_tokens ?? 0;
   target.output_tokens += usage?.output_tokens ?? 0;
   target.total_tokens += usage?.total_tokens ?? 0;
+  if (usage?.estimated) {
+    target.estimated_calls += 1;
+    target.estimated_input_tokens += usage.input_tokens ?? 0;
+    target.estimated_output_tokens += usage.output_tokens ?? 0;
+    target.estimated_total_tokens += usage.total_tokens ?? 0;
+  }
   if (Number.isFinite(durationMs)) {
     target.latency_ms += durationMs;
     target.latency_count += 1;
@@ -147,6 +289,10 @@ function mergeUsage(target, source) {
   target.input_tokens += source?.input_tokens ?? 0;
   target.output_tokens += source?.output_tokens ?? 0;
   target.total_tokens += source?.total_tokens ?? 0;
+  target.estimated_calls += source?.estimated_calls ?? 0;
+  target.estimated_input_tokens += source?.estimated_input_tokens ?? 0;
+  target.estimated_output_tokens += source?.estimated_output_tokens ?? 0;
+  target.estimated_total_tokens += source?.estimated_total_tokens ?? 0;
   target.latency_ms += source?.latency_ms ?? 0;
   target.latency_count += source?.latency_count ?? 0;
 }
@@ -168,6 +314,10 @@ function usageRange(data, days) {
       input_tokens: bucket.input_tokens ?? 0,
       output_tokens: bucket.output_tokens ?? 0,
       total_tokens: bucket.total_tokens ?? 0,
+      estimated_calls: bucket.estimated_calls ?? 0,
+      estimated_input_tokens: bucket.estimated_input_tokens ?? 0,
+      estimated_output_tokens: bucket.estimated_output_tokens ?? 0,
+      estimated_total_tokens: bucket.estimated_total_tokens ?? 0,
       avg_latency_ms: bucket.latency_count
         ? Math.round(bucket.latency_ms / bucket.latency_count)
         : 0
@@ -182,6 +332,10 @@ function usageRange(data, days) {
       input_tokens: total.input_tokens,
       output_tokens: total.output_tokens,
       total_tokens: total.total_tokens,
+      estimated_calls: total.estimated_calls,
+      estimated_input_tokens: total.estimated_input_tokens,
+      estimated_output_tokens: total.estimated_output_tokens,
+      estimated_total_tokens: total.estimated_total_tokens,
       avg_latency_ms: total.latency_count
         ? Math.round(total.latency_ms / total.latency_count)
         : 0
@@ -195,6 +349,10 @@ function usageRange(data, days) {
           input_tokens: usage.input_tokens,
           output_tokens: usage.output_tokens,
           total_tokens: usage.total_tokens,
+          estimated_calls: usage.estimated_calls,
+          estimated_input_tokens: usage.estimated_input_tokens,
+          estimated_output_tokens: usage.estimated_output_tokens,
+          estimated_total_tokens: usage.estimated_total_tokens,
           avg_latency_ms: usage.latency_count
             ? Math.round(usage.latency_ms / usage.latency_count)
             : 0
@@ -337,22 +495,34 @@ export class RuntimeState {
       state.status = "healthy";
       state.cooldown_until = 0;
       state.last_error = null;
-      const usage = metadata.usage ?? null;
+      const usage = usageWithEstimate(metadata.usage ?? null, metadata);
       state.token_usage.requests += 1;
       if (usage) {
         state.token_usage.input_tokens += usage.input_tokens ?? 0;
         state.token_usage.output_tokens += usage.output_tokens ?? 0;
         state.token_usage.total_tokens += usage.total_tokens ?? 0;
+        if (usage.estimated) {
+          state.token_usage.estimated_requests += 1;
+          state.token_usage.estimated_input_tokens += usage.input_tokens ?? 0;
+          state.token_usage.estimated_output_tokens += usage.output_tokens ?? 0;
+          state.token_usage.estimated_total_tokens += usage.total_tokens ?? 0;
+        }
       }
       state.last_request = {
         result: "success",
         request_id: metadata.request_id ?? null,
+        thread_id: metadata.thread_id ?? null,
+        rollout_path: metadata.rollout_path ?? null,
         requested_model: metadata.requested_model ?? null,
         logical_model: metadata.logical_model ?? null,
         upstream_model: metadata.upstream_model ?? deployment.model,
         duration_ms: metadata.duration_ms ?? null,
         usage,
         response_text: clippedText(metadata.response_text),
+        raw_response_id: metadata.raw_response_id ?? null,
+        raw_response_path: metadata.raw_response_path ?? null,
+        raw_response_available: Boolean(metadata.raw_response_path),
+        raw_response_bytes: metadata.raw_response_bytes ?? 0,
         at: new Date().toISOString()
       };
       data.recent_calls.unshift({
@@ -385,12 +555,18 @@ export class RuntimeState {
           deployment_id: deployment.id,
           provider: deployment.provider,
           request_id: metadata.request_id ?? null,
+          thread_id: metadata.thread_id ?? null,
+          rollout_path: metadata.rollout_path ?? null,
           requested_model: metadata.requested_model ?? null,
           logical_model: metadata.logical_model ?? null,
           upstream_model: metadata.upstream_model ?? deployment.model,
           duration_ms: metadata.duration_ms ?? null,
           usage: null,
           response_text: clippedText(metadata.response_text),
+          raw_response_id: metadata.raw_response_id ?? null,
+          raw_response_path: metadata.raw_response_path ?? null,
+          raw_response_available: Boolean(metadata.raw_response_path),
+          raw_response_bytes: metadata.raw_response_bytes ?? 0,
           error: state.last_error,
           at: new Date().toISOString()
         };
@@ -445,7 +621,7 @@ export class RuntimeState {
         provider: deployment.provider,
         model: deployment.model,
         enabled: deployment.enabled !== false,
-        credential_configured: !String(deployment.api_key ?? "").startsWith("missing-env:"),
+        credential_configured: credentialConfigured(deployment),
         status:
           deployment.enabled === false
             ? "disabled"
@@ -488,11 +664,16 @@ export class RuntimeState {
     const safeLimit = Math.min(100, Math.max(1, Number(limit) || 20));
     return this.store.read((data) => {
       const calls = normalizeData(data).recent_calls;
+      const totalPages = Math.max(1, Math.ceil(calls.length / safeLimit));
+      const page = Math.min(Math.floor(safeOffset / safeLimit), totalPages - 1);
+      const effectiveOffset = page * safeLimit;
       return {
-        offset: safeOffset,
+        offset: effectiveOffset,
         limit: safeLimit,
         total: calls.length,
-        calls: calls.slice(safeOffset, safeOffset + safeLimit)
+        page,
+        total_pages: totalPages,
+        calls: calls.slice(effectiveOffset, effectiveOffset + safeLimit)
       };
     });
   }

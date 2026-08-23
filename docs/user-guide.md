@@ -1,6 +1,6 @@
 # Codex Relay 用户文档
 
-最后更新：2026-08-21
+最后更新：2026-08-23
 
 这是一份给日常使用者看的快速说明。目标很简单：让 Codex 只连一个稳定地址，后面的多个上游 URL 和 API Key 交给中转站自动处理。
 
@@ -13,6 +13,38 @@
 - 某个上游临时故障、超时或网络不通
 
 你不用手工改 Codex 配置里的 URL，也不用每次出问题都去换 key。
+
+## 多用户 CLI
+
+如果同一台电脑由多个人使用，并且每个人需要自己的 API，可以使用 CLI 账号模式：
+
+```bash
+npm run cli register
+npm run cli login
+npm run cli
+```
+
+现在 CLI 是一个可返回的终端控制台，不需要记住数字菜单：
+
+- `↑` / `↓`：移动高亮选中项；
+- `Enter`：进入页面、打开记录或确认当前操作；
+- `Esc`：返回上一页；编辑过程中按 `Esc` 会取消当前编辑，不保存修改；
+- `←` / `→`：在看板切换周/月/年，在日志切换上一页/下一页，在详情切换 Summary/JSON；
+- `Ctrl+S`：保存表单；`Ctrl+X`：清空当前字段；`Ctrl+C` 或 `q`：退出。
+
+主页面包含：
+
+- `APIs & keys`：用上下键选择 API，按 `Enter` 编辑，按 `a` 新增，按 `t` 测试，按 `d` 删除并确认；
+- `Routes / aliases`：编辑 Codex 可使用的逻辑模型别名；
+- `Overview`：按周、月、年查看调用、token、平均延迟和模型对比；
+- `Recent logs`：分页查看调用记录，按 `Enter` 打开详情，再按 `j` / `s` 切换 JSON / Summary；
+- `Codex provider`：切换 Codex 的 `openai` / `relay`，同时更新 Codex threads 的 provider 字段；
+- `Account & session`：设置默认账号、退出当前终端或删除账号；
+- `Reload relay`：保存后可直接让运行中的 relay 重新加载当前 profile。
+
+测试 API 时会立即显示 `Testing...`，请求完成后进入结果页，直接展示成功/失败、deployment、真实上游模型、耗时、token usage 和响应预览；测试过程中再次按键不会重复发起请求。
+
+网页管理台左侧的 `Account` 区也提供同等操作：注册、登录、退出到 Guest、设置默认账号和删除账号。账号数据在 `~/.codex-relay/` 下按用户隔离。当前终端的登录 session 优先于默认账号，因此不同终端可以分别登录不同用户。没有当前登录 session、也没有默认账号时，Relay 会使用 `.env` 里的 `RELAY_API_KEY` 作为 Guest；Guest 继续使用项目根目录的 `config.json` 和默认状态文件。登录用户、默认用户和 Guest 的配置、调用日志、状态统计互相隔离。
 
 ## 快速开始
 
@@ -38,7 +70,7 @@ npm start
 http://127.0.0.1:8787/admin
 ```
 
-第一次启动时，服务会自动生成内部使用的 `RELAY_API_KEY` 和 `RELAY_ADMIN_KEY`。本机打开管理控制台不需要手动填写 Admin Key。进入后在 Secrets 区域填写上游 API Key：
+第一次启动时，服务会自动生成内部使用的 `RELAY_API_KEY` 和 `RELAY_ADMIN_KEY`。本机打开管理控制台不需要手动填写 Admin Key，默认进入 Guest profile，体验和单用户版本一致。进入后在 Secrets 区域填写上游 API Key：
 
 ```dotenv
 UPSTREAM_A_KEY_1=your-upstream-key-1
@@ -81,7 +113,7 @@ command = "node"
 args = ["/absolute/path/to/scripts/relay-token.mjs", "/absolute/path/to/.env", "RELAY_API_KEY"]
 ```
 
-这个 auth command 会自动从 `.env` 读取内部 relay token，所以你不需要在终端里手动 `export RELAY_API_KEY`。
+这个 auth command 会优先读取当前终端的多用户 session，其次读取免登录默认账号；如果两者都不存在，就从 `.env` 读取 Guest 的内部 relay token，所以不需要手动 `export RELAY_API_KEY`。
 
 ## 配置上游 key
 
@@ -139,7 +171,43 @@ curl http://127.0.0.1:8787/readyz
 curl http://127.0.0.1:8787/api/status/public
 ```
 
-管理控制台的 `Overview` 可以切换 `Week / Month / Year`。`Year` 是类似 GitHub contribution 的 token 热力图，适合看长期调用活跃度；`Logs` 支持分页，调用多了也不会把页面无限拉长。
+管理控制台的 `Overview` 可以切换 `Week / Month / Year`。`Year` 是类似 GitHub contribution 的 token 热力图，适合看长期调用活跃度；大数字会自动添加千位分隔符；`Logs` 支持分页，调用多了也不会把页面无限拉长。
+
+### Sessions 页面
+
+管理控制台的 `Sessions` 页面把 Codex 的 `threads` 表和 Relay 的 `recent_calls` 合并展示。只有请求中明确携带了可识别的 `thread_id`，请求才会计入对应 session；没有关联 ID 的调用会显示在 `unlinked` 计数中，不会被猜到某个 session。
+
+页面默认按最近活跃时间排序，也可以按 Requests、RPM 或 Tokens 排序。搜索框支持空格分隔的多个关键词，并采用 AND 逻辑。例如：
+
+```text
+dashboard ~/Documents/projects/project deepseek
+```
+
+表示同一个 session 必须同时命中 `dashboard`、目录片段和 `deepseek`。搜索字段包含 session 标题、ID、目录、模型、provider、rollout 路径，以及最近请求的 deployment 和 request ID。
+
+RPM 默认按 15 分钟固定窗口计算：
+
+```text
+RPM = 最近 15 分钟的请求数 / 15
+```
+
+只有 1 个请求时会显示约 `0.07 RPM`，不会被当作瞬时高峰。可以切换 5 分钟或 60 分钟窗口。Session 详情中的 `observed RPM` 用于观察首尾请求之间的 burst 密度，只有 1 个请求时显示为 0。
+
+Sessions 列表会定期刷新，刷新期间不会覆盖正在输入的搜索词；点击 `Refresh` 可以立即更新。列表同时读取 Codex 的 `~/.codex/state_5.sqlite`，默认只显示有 Relay 请求或有 token 使用量的会话，所以不会被从未使用过的空线程淹没。即使某次请求没有携带可关联的 thread ID，只要 Codex 保存了该会话的 token 使用量，仍然可以显示。卡片会标明 token 来源：`Codex tokens` 表示来自 Codex 本地状态，`Relay tokens` 表示来自 Relay 调用记录，`Codex + Relay` 表示两者都存在。点击某个 session 可以查看 RPM、token 总量、rollout 路径和最近 Relay 请求，再点击请求即可打开完整的调用详情。
+
+通过管理鉴权的用户还可以点击顶部的 `Stop Relay` 停止中转服务。按钮会二次确认，并在服务返回确认后优雅关闭监听；未登录用户不能使用。服务停止后，在项目目录执行下面的命令即可后台启动：
+
+```bash
+npm run start:background
+```
+
+也可以使用前台模式：
+
+```bash
+npm run start
+```
+
+后台脚本会写入 `.codex-relay.pid` 和 `.codex-relay.log`，重复执行不会启动第二个 Relay，并会从启动日志显示实际管理地址。若使用 launchd、Docker 等外部进程管理器，停止后仍可能被管理器自动拉起。
 
 ## 常见用法
 

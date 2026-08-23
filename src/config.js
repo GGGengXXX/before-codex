@@ -209,7 +209,9 @@ export function validateConfig(config) {
       sanitize_request_items: true,
       sanitize_response_items: true,
       drop_invalid_reasoning_items: true,
-      strip_invalid_request_item_ids: true
+      strip_invalid_request_item_ids: true,
+      strip_invalid_response_item_ids: true,
+      convert_dsml_tool_calls: true
     }
   );
   config.routing.cooldowns ??= {};
@@ -279,6 +281,11 @@ export function resolveModelConfig(config, requestedModel) {
     if (modelConfig.aliases?.includes(requestedModel)) {
       return { name, config: modelConfig };
     }
+  }
+  const entries = Object.entries(config.models);
+  if (entries.length === 1) {
+    const [name, modelConfig] = entries[0];
+    return { name, config: modelConfig, defaulted: true };
   }
   return null;
 }

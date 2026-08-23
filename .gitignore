@@ -3,5 +3,7 @@ node_modules/
 config.json
 .codex-relay-state.json
 .codex-relay-state.json.lock/
+.codex-relay-state.json.raw/
+.codex-relay.pid
 *.log
 .DS_Store

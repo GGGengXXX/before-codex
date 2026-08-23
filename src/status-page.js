@@ -81,15 +81,19 @@ export function renderStatusPage() {
     <footer>Public status intentionally omits base URLs and credential material. Refreshes every 5 seconds.</footer>
   </main>
   <script>
+    function formatNumber(value) {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric.toLocaleString('en-US') : String(value ?? '0');
+    }
     async function refresh() {
       const response = await fetch('/api/status/public');
       const data = await response.json();
       const deployments = data.deployments || [];
       const healthy = deployments.filter(item => item.status === 'healthy').length;
       const values = document.querySelectorAll('.metric .value');
-      values[1].textContent = deployments.length;
-      values[2].textContent = healthy;
-      values[3].textContent = deployments.reduce((sum, item) => sum + item.attempts, 0);
+      values[1].textContent = formatNumber(deployments.length);
+      values[2].textContent = formatNumber(healthy);
+      values[3].textContent = formatNumber(deployments.reduce((sum, item) => sum + item.attempts, 0));
       document.querySelector('#deployments').innerHTML = deployments.map(item => {
         const issue = item.last_error ? item.last_error.code + ' / ' + item.last_error.status : 'none';
         return '<tr>' +
@@ -97,7 +101,7 @@ export function renderStatusPage() {
           '<td>' + item.provider + '</td>' +
           '<td>' + item.model + '</td>' +
           '<td><span class="status ' + item.status + '">' + item.status + '</span></td>' +
-          '<td>' + item.successes + ' / ' + item.failures + '</td>' +
+          '<td>' + formatNumber(item.successes) + ' / ' + formatNumber(item.failures) + '</td>' +
           '<td>' + issue + '</td>' +
           '</tr>';
       }).join('') || '<tr><td colspan="6">No deployments configured.</td></tr>';

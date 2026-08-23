@@ -651,7 +651,7 @@ API 卡片里的 `api_key`、`base_url`、`model` 等输入框每输入一个字
 
 ```text
 npm run check 通过
-npm test       30 个测试通过
+npm test       36 个测试通过
 ```
 
 已覆盖：
@@ -683,6 +683,43 @@ npm test       30 个测试通过
 - 请求侧会过滤 replay 历史里的非法 reasoning item，避免 `item_*` 被发送给严格上游。
 - 非流式 Responses 响应会过滤非法 reasoning item，避免继续污染 Codex 本地历史。
 - Responses SSE 事件会过滤非法 reasoning item，同时保留可转发的 message 和 completed 事件。
+- Relay 的 Logs 现在会记录 retryable failover 的中间失败尝试，不只记最终成功。
+- `/v1/models` 同时返回 `data` 和 Codex CLI 期望的 `models`，并为每个模型补充 `slug`、`display_name`、reasoning levels 等 Codex 模型管理器需要的元数据。
+- 流式请求在 Codex CLI 已收到输出后主动断开时，会写入成功调用日志，避免用户看到 CLI 有结果但 Logs 不更新。
+- SSE 文本提取兼容 `delta`、chat-completions `choices[].delta.content`、Responses `item.content` 和 `response.output` 等常见形态。
+- 当配置中只有一个逻辑模型时，Codex 侧传来的未知模型名会自动落到这个默认逻辑模型，真实上游模型仍由 deployment 的 `model` 决定。
+- 当上游没有返回 `usage` 时，Relay 会按请求文本和返回文本做粗略 token 估算，并在调用记录和持久化统计中标记 `estimated: true`；估算值只用于看板趋势，不应作为账单依据。对于明显像 base64 / opaque blob 的长串响应，Relay 会保守处理，避免把整串误算成自然语言 token。
+- Logs 改为真正的分页视图：服务端按 `offset + limit` 返回，前端支持首页、上一页、下一页、末页和每页 10/20/50 条切换，列表不再依赖一个大滚动容器。
+
+## 9. 本机多用户账号与 CLI
+
+### 需求
+
+同一台机器可能由多个用户使用。每个用户需要自己的 API、路由、调用日志和 token 统计，同时希望登录动作只影响当前终端；没有登录时，也可以选择一个免登录默认账号。
+
+### 设计
+
+- `src/accounts.js` 负责账号生命周期、密码 hash、用户 token、终端 session 和默认账号；密码使用 Node `scryptSync`，不保存明文密码。
+- 每个账号独立保存 `config.json` 和 `state.json` 到 `~/.codex-relay/users/<username>/`；注册时不会复制全局配置里的真实 API key，而是生成禁用的空 profile，要求用户主动填写自己的 key。
+- `scripts/relay-token.mjs` 按优先级读取当前终端 session、免登录默认账号、旧版 `.env` 全局 token。macOS Terminal/iTerm 的 session 环境变量用于区分不同终端。
+- Relay 的 `/v1/models` 和 `/v1/responses` 收到用户 token 后，会加载对应 profile 和 state；注册过账号后，旧全局 token 不再绕过账号隔离。没有任何账号时保留旧单用户兼容模式。
+- `src/cli.js` 使用 Node 原生 readline 和 ANSI 彩色输出，覆盖注册、登录、注销、删除、默认账号、API/route 编辑、测试、看板、日志和 Codex provider 切换，不额外引入 CLI 依赖。
+
+### 遇到的问题与修复
+
+- 初版用户 profile 直接 clone 全局配置，会意外继承全局 API key；改成注册时清空 key 并禁用 deployment。
+- profile 请求路径第一次集成测试暴露 `server.js` 漏引入 `createRuntimeState`，补充 import 后修复。
+- 测试账号公开信息不能包含 api token；token 只从内部认证记录和受保护本地文件取得。
+- 账号模式不能继续接受旧 global key 作为绕过凭证，否则用户隔离没有意义；改为“有账号则只接受用户 token，无账号才兼容旧模式”。
+
+### 当前验证
+
+```text
+npm run check 通过
+npm test       39 个测试通过
+```
+
+新增覆盖：账号注册/密码认证、session 隔离、默认账号、token 轮换、账号删除，以及真实 relay 请求按用户 token 路由到独立 profile。
 
 ## 8. Responses item ID 兼容过滤
 
@@ -709,7 +746,8 @@ Invalid 'input[324].id': 'item_...'. Expected an ID that begins with 'rs'.
       "sanitize_request_items": true,
       "sanitize_response_items": true,
       "drop_invalid_reasoning_items": true,
-      "strip_invalid_request_item_ids": true
+      "strip_invalid_request_item_ids": true,
+      "strip_invalid_response_item_ids": true
     }
   }
 }
@@ -722,11 +760,29 @@ Invalid 'input[324].id': 'item_...'. Expected an ID that begins with 'rs'.
 - 请求侧：当 Codex replay 的 `input` 数组中出现 `type: "reasoning"` 但 ID 不是 `rs*` 时，转发上游前移除该 item。
 - 请求侧：普通 `message`、`function_call`、`function_call_output` 如果带有明显错误的第三方 `id`，会去掉 `id`，但保留内容和 `call_id`。
 - 响应侧：非流式 JSON 响应中的非法 reasoning item 会被移除，避免再次写入 Codex 本地历史。
+- 响应侧：普通 `message`、`function_call`、`function_call_output` 如果带有明显错误的第三方 `id`，会去掉 `id`，避免污染后续 compact/replay 历史。
 - 响应侧：SSE 中的非法 reasoning item 事件会被丢弃，`response.completed` 里的 `output` 数组也会同步清理。
 
 ### 心得
 
 这类兼容层最容易犯的错是“修前缀”。但 Responses item ID 不是纯展示字段，它可能参与后续状态恢复。中转站更适合做协议防火墙：丢弃明确非法、不可移植的 provider state，保留用户消息、工具输出和可读文本。
+
+### 2026-08-22 复发：message item id 前缀错误
+
+后续又遇到相同家族的错误，但类型从 reasoning 变成了 message：
+
+```text
+[ApiIdParam] [input[286].id] [invalid_id_prefix] Invalid 'input[286].id': 'item_200f953b826354e8132eb110'. Expected an ID that begins with 'msg'.
+```
+
+原因是第一次修复主要挡住非法 reasoning item，以及请求侧 replay 中的错误 item id；但响应侧仍可能把第三方返回的 `type: "message", id: "item_*"` 原样交给 Codex。Codex 将其写入本地历史后，后续 compact 或切换到更严格上游时仍会失败。
+
+修复：
+
+- 新增默认开启的 `strip_invalid_response_item_ids`；
+- 非流式 Responses payload 会去掉 message/tool item 上错误的第三方 `id`；
+- Responses SSE 事件也会在转发前清理 `item.id` 和 `response.output[].id`；
+- 增加非流式和 SSE 两条回归测试，覆盖 `Expected an ID that begins with 'msg'` 这一形态。
 
 ## 9. 当前未完成项
 
@@ -749,3 +805,835 @@ Invalid 'input[324].id': 'item_...'. Expected an ID that begins with 'rs'.
 当前实现的核心心得：
 
 > 先把 Codex 能否稳定完成一次 Responses 会话做正确，再扩展成通用 LLM 平台。
+
+## 11. Test API 交互反馈与重复提交修复（2026-08-23）
+
+### 问题
+
+管理页面的 `Test` 请求可能需要较长时间，但按钮点击后没有 loading 状态，也没有防重复提交机制。用户连续点击会并发发起多个相同测试请求；请求异常时只有顶部通知，无法直接查看测试结果详情。
+
+### 设计
+
+- 使用 `testingDeployments` Set 按 deployment ID 维护测试中的 API；不同 API 可以并行测试，同一个 API 只允许一个测试请求。
+- 点击后立即重绘当前 API 卡片，将按钮改为 `Testing...` 并禁用，同时显示顶部状态通知。
+- 成功和失败都通过既有的 `Test Result` 详情弹窗展示，保留状态、模型、耗时、usage、返回内容或错误信息。
+- 使用 `finally` 释放锁并恢复按钮，确保保存失败、上游失败和成功响应都不会让按钮永久卡住。
+
+### 心得
+
+耗时操作的反馈必须在请求发出前就更新 UI；只在请求结束后刷新页面，会让用户误以为点击没有生效。锁定粒度放在单个 deployment，而不是全局，可以同时保留多 API 的测试效率。
+
+## CLI 控制台重做（2026-08-23）
+
+### 问题
+
+初版 CLI 是 `readline.question()` 加数字菜单。它能覆盖功能，但操作是线性的：用户需要记住命令数字，编辑没有字段光标，无法在页面之间返回，也没有稳定的长操作反馈。这种交互不适合多用户反复维护 API 配置。
+
+### 设计
+
+- 使用 Node 原生 `readline.emitKeypressEvents()` 和 raw mode，避免增加 CLI 依赖；
+- 把 CLI 建模为页面状态机：Welcome、Control center、APIs、Routes、Logs、Call detail、Overview、Provider、Account 和 Form；
+- 用 `backStack` 保存页面路径，统一由 `Esc` 返回；表单取消不会写盘；
+- 列表有明确的绿色 `>` 高亮项，`↑↓` 移动，`Enter` 打开；日志使用固定页大小并支持左右翻页；
+- 表单同时维护字段索引和文本光标，API key 用掩码显示，`Ctrl+X` 清空字段，`Ctrl+S` 保存；
+- 测试、保存、provider 切换和 relay reload 都在开始异步操作前刷新状态栏，并锁定按键处理；
+- 按键事件使用队列顺序处理，避免用户快速按下“下一个 + 回车”时丢失第二个按键；异步操作期间到达的按键直接丢弃，避免测试完成后重复执行积压操作；
+- API/profile 保存先写临时文件并用 `loadConfig()` 校验，校验失败保留原配置；成功后尝试调用 `/admin/reload`，relay 未运行时仍保留已保存配置并给出明确提示。
+
+### 交互结果
+
+```text
+Control center
+  > Overview
+    APIs & keys
+    Routes / aliases
+    Recent logs
+```
+
+CLI 不再要求用户记住 `1/2/3` 菜单。用户可以在编辑 API 的任意字段按 `Esc` 返回，不会因为中途查看配置而丢失导航上下文；日志详情支持 Summary 和 JSON 两种视图。
+
+### 遇到的问题与修复
+
+- 初次 PTY 验证发现快速发送方向键和回车时，单一 `handlingKey` 标志会丢弃后续按键；改成 FIFO 按键队列；
+- 测试请求等待期间如果积压 `t`，测试结束后可能再次触发；改为在 raw-mode 入口和处理器两层丢弃 busy 期间的按键；
+- `npm run cli register` 在没有现成登录 session 时最初不会打开注册表单；调整初始化顺序，使 register/login 命令直接进入对应页面；
+- Guest 页面和登录页面都支持 `q` 退出，避免用户只能移动到 Exit 再确认。
+- 网页端已有删除 deployment 操作，CLI 增加了独立确认表单；最后一个 deployment 不允许删除，避免生成无法通过配置校验的空 route。
+
+### 验证
+
+```text
+npm run check 通过
+npm run cli -- --help 通过
+PTY 验证：上下键高亮、Enter 进入、Esc 返回、API 表单、register 页面通过
+npm test：沙箱禁止监听 127.0.0.1，39 个 HTTP 集成用例报 listen EPERM；非网络单元用例通过
+```
+
+## 12. DSML tool call 兼容修复（2026-08-23）
+
+### 现象
+
+会话 `01a024cc-d708-7e31-8ea8-c4d754bcf176` 的 rollout 中，助手消息正文包含：
+
+```text
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="exec">...</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>
+```
+
+这说明上游把本应是结构化工具调用的 DSML 协议当成了普通文本返回。Relay 原先会原样转发，Codex 因此直接显示协议标签，而不会执行工具。
+
+### 修复
+
+- 默认开启 `routing.compatibility.convert_dsml_tool_calls`。
+- 非流式 Responses 中检测完整 DSML block，将每个 `invoke` 转换为 Responses `function_call` output item。
+- 保留 DSML block 外的普通文本，去掉协议标签，避免用户看到内部 XML/DSML。
+- 流式响应在检测到完整 DSML block 后转换为 `response.output_item.*`、参数 delta/done 和 `response.completed` 事件。
+- 只转换结构完整且包含 `invoke` 的 block；普通文本中的相似片段不会被误删。
+
+### 限制
+
+该兼容层只能恢复上游已经完整返回的工具调用。若上游把工具协议拆成无法闭合的半截文本，Relay 不会伪造调用；这时仍需修正上游的 tool calling 模式或模型适配器。
+
+## 13. 管理页面视图保持与 Logs 自动刷新（2026-08-23）
+
+### 问题
+
+管理页面的 Overview、Logs、APIs 是同一页中的工作区标签。原先刷新配置后没有持久化当前标签，用户在 APIs 页面点击刷新可能回到 Overview；Logs 也只能手动刷新，无法及时看到新调用。
+
+### 设计
+
+- 将当前工作区标签保存到 localStorage，支持 overview、logs、apis 三个值。
+- 将 Logs 当前页码和每页条数一起保存，重新加载页面后尽量回到原来的分页位置。
+- 管理页内的 Refresh、Save、Reload 等操作完成后重新应用当前标签状态，不改变用户正在查看的工作区。
+- Logs 仅在 Logs 标签激活且浏览器页面可见时每 15 秒自动请求当前页；切换到其他标签或页面进入后台后停止轮询。
+- 页面重新回到前台时立即刷新一次 Logs，避免后台期间错过最新记录。
+
+### 心得
+
+“刷新数据”和“重置界面导航”应该是两个独立动作。配置刷新只更新数据模型，工作区标签和日志分页属于用户界面状态，应单独持久化并恢复。
+
+## 13. SSE 中途断流导致 Codex 静默停止（2026-08-23）
+
+### 现象
+
+会话 `01a02abe-5bc3-7810-9e8a-249695d5e026` 中多次出现：Codex 已经开始 reasoning 或工具调用，但最终 `task_complete.last_agent_message` 为 `null`，rollout 没有错误，也没有最终输出。
+
+典型证据：
+
+- rollout 行 `7743`：只收到 reasoning item，摘要为 `**Applying patch**`；
+- rollout 行 `7745`：`task_complete`，`duration_ms` 约 `120339`，`last_agent_message: null`；
+- rollout 行 `7763-7764`：已经执行了一次工具调用；
+- rollout 行 `7773`：`task_complete`，`duration_ms` 约 `161058`，`last_agent_message: null`；
+- relay state 中对应时间点存在上游失败：`This operation was aborted`，耗时约 `120s`。
+
+这不是 DSML 泄漏问题，而是流式响应中途断开后，Relay 把异常流包装成了看起来正常的完成事件。
+
+### 原因
+
+之前为了避免 Codex 报：
+
+```text
+stream disconnected before completion: stream closed before response.completed
+```
+
+Relay 在上游 SSE 已经发出首个事件、但后续断流且没有 `response.completed` 时，会合成一个 `response.completed`。这对 `[DONE]` 结尾但缺少 completed 事件的兼容场景有用，但对真实的超时/abort 是错误的。
+
+结果是：Codex 收到了“完成”语义，但没有可见 assistant message，也没有明确 failure，于是表现为任务自己停掉。
+
+### 修复
+
+- 保留 `[DONE]` 兼容：只有检测到 `data: [DONE]` 且缺少 `response.completed` 时，才合成 `response.completed`。
+- 对“已提交 SSE 首事件、但未见 `[DONE]`/terminal event 就断流”的情况，改为合成 `response.failed`。
+- catch 路径中发生已提交流异常时，也发送 `response.failed`，不再伪造 `response.completed`。
+- 记录失败并让 deployment 进入 cooldown，避免同一坏上游持续造成静默停止。
+
+### 回归测试
+
+新增覆盖：
+
+- 已提交首个 SSE event 后断流：应返回 `response.failed`，不 failover，也不返回 `response.completed`；
+- 只输出不可见 reasoning 后断流：应返回 `response.failed`，避免 Codex 静默完成；
+- 只有 `[DONE]` 的兼容流：仍允许合成 `response.completed`。
+
+验证：
+
+```text
+npm test   # 50 passed
+npm run check
+```
+
+## 14. 两个关键 Bug 的通俗复盘（2026-08-23）
+
+这一轮实际解决的是两个不同层面的兼容问题。它们看起来都发生在 Codex 使用中转站时，但根因不一样。
+
+### Bug 1：`invalid_id_prefix`，历史消息被第三方 ID 污染
+
+#### 现象
+
+Codex 报类似错误：
+
+```text
+Invalid 'input[286].id': 'item_200f953b826354e8132eb110'. Expected an ID that begins with 'msg'.
+```
+
+或者：
+
+```text
+Expected an ID that begins with 'rs'.
+```
+
+#### 通俗解释
+
+Responses API 对不同类型的历史 item 有固定 ID 前缀要求：
+
+- 普通消息应该像 `msg_...`；
+- reasoning 应该像 `rs_...`；
+- function call 应该像 `fc_...`。
+
+但部分第三方上游会返回统一的 `item_...`。Codex 收到后会把这些 item 写进本地 session 历史。下一轮请求或 compact 时，Codex 又把这些历史发回去，于是严格兼容的上游直接拒绝。
+
+所以这个问题不是“当前这一条请求坏了”，而是“上一轮返回的坏 ID 写进了历史，污染了后续请求”。
+
+#### 解决方式
+
+Relay 现在在两端都做了防护：
+
+1. **请求发出前清理历史**：如果 Codex replay 的历史里带了错误 ID，Relay 会在转发上游前去掉这些非法 `id`。
+2. **响应返回前清理上游结果**：如果第三方上游返回 `type: "message"` 但 `id` 是 `item_...`，Relay 会先去掉这个错误 ID，再交给 Codex。
+3. **reasoning 特殊处理**：非法 reasoning item 不强行改前缀，而是丢弃。因为 reasoning item 可能包含上游私有状态，改个名字并不能保证可用。
+
+#### 结果
+
+坏 ID 不会再进入 Codex 本地历史，也不会在后续 compact/replay 时再次触发 `invalid_id_prefix`。
+
+---
+
+### Bug 2：Codex 自己停了，没有错误、没有输出
+
+#### 现象
+
+会话 `01a02abe-5bc3-7810-9e8a-249695d5e026` 里出现多次：
+
+- Codex 已经开始 reasoning；
+- 甚至已经调用过工具；
+- 最后却直接 `task_complete`；
+- `last_agent_message` 是 `null`；
+- UI 上看起来就是“任务自己停了”。
+
+典型 rollout 证据：
+
+```text
+7743: reasoning: **Applying patch**
+7745: task_complete, last_agent_message: null, duration_ms: 120339
+7763-7764: 已经执行 custom_tool_call
+7773: task_complete, last_agent_message: null, duration_ms: 161058
+```
+
+Relay state 里同一时间也能看到：
+
+```text
+This operation was aborted
+耗时约 120s
+```
+
+#### 通俗解释
+
+之前为了修另一个报错：
+
+```text
+stream disconnected before completion: stream closed before response.completed
+```
+
+Relay 做过一个兼容逻辑：如果上游流式响应结束时没有 `response.completed`，Relay 就补一个 `response.completed`。
+
+这个逻辑对一种情况是有用的：有些上游最后只发 `data: [DONE]`，不发标准的 `response.completed`。
+
+但它误伤了另一种情况：上游其实是超时或断流了，并不是正常结束。
+
+于是流程变成：
+
+```text
+上游真实情况：中途断流 / timeout
+Relay 旧行为：补一个 response.completed
+Codex 理解：任务正常完成
+实际结果：没有最终回答，所以看起来像 Codex 静默停止
+```
+
+#### 解决方式
+
+Relay 现在把这两种情况分开处理：
+
+1. **如果看到 `data: [DONE]`**：说明上游至少明确表达了结束，可以继续补 `response.completed`。
+2. **如果没有 `[DONE]`，也没有 `response.completed` / `response.failed` / `response.incomplete`**：说明这是异常断流，Relay 不再伪造完成，而是返回 `response.failed`。
+3. **已经开始流式输出后断掉**：不会再 failover 到另一个上游，因为客户端已经收到前半段流了；但会明确告诉 Codex 这是失败，而不是完成。
+4. **记录失败并 cooldown 当前 deployment**：避免同一个不稳定上游连续造成静默停止。
+
+#### 结果
+
+Codex 不应再把真实断流误判为正常完成。以后如果上游 120s timeout 或 stream abort，应该能看到明确失败，而不是“没有报错也没有输出地停掉”。
+
+---
+
+### 一句话总结
+
+- `invalid_id_prefix` 是 **第三方上游返回了不符合 Responses API 规范的 item ID，污染了 Codex 历史**；解决方式是 Relay 做请求/响应双向清洗。
+- 静默停止是 **Relay 把上游异常断流伪装成了正常完成**；解决方式是只在看到 `[DONE]` 时补完成，否则返回 `response.failed`。
+
+这两个问题都属于“中转站协议适配层”的问题，不是普通聊天能力问题。Codex 这种 agent 会持续 replay 历史、调用工具、消费 SSE 事件，所以比普通聊天更容易暴露这些协议语义错误。
+
+## 15. `response.failed` 超时提示与丢弃 item ID 的影响评估（2026-08-23）
+
+### `response.failed` 是否会明确提示超时
+
+当前策略分三类：
+
+1. **明确请求超时**
+
+   如果 Relay 自己的 `request_timeout_ms` 触发，或者流式响应已经开始后，在接近 `request_timeout_ms` 的时间点断开，Relay 会返回：
+
+   ```json
+   {
+     "type": "response.failed",
+     "response": {
+       "status": "failed",
+       "error": {
+         "code": "upstream_timeout",
+         "message": "Upstream stream timed out after ...ms before a terminal Responses event."
+       }
+     }
+   }
+   ```
+
+   这类会在 `error.code` 上明确标成 `upstream_timeout`。
+
+2. **普通异常断流**
+
+   如果上游很快主动断开，且时间明显没有接近 `request_timeout_ms`，Relay 会返回：
+
+   ```json
+   {
+     "error": {
+       "code": "upstream_network_error",
+       "message": "Upstream stream closed before a terminal Responses event."
+     }
+   }
+   ```
+
+   这类不强行说成 timeout，避免误导排查。
+
+3. **兼容 `[DONE]` 的正常结束**
+
+   如果上游最后发了 `data: [DONE]`，只是没发标准 `response.completed`，Relay 仍会补 `response.completed`。这是为了兼容部分 OpenAI-compatible SSE 实现。
+
+### 为什么不用一刀切把所有断流都说成 timeout
+
+因为“断流”有多种原因：
+
+- Relay 自己超时；
+- 上游网关超时；
+- 上游主动关闭连接；
+- 网络层 reset；
+- 客户端取消；
+- provider 内部崩溃。
+
+只有耗时接近 `request_timeout_ms` 的断流，才有足够证据归为 timeout。否则统一写 timeout 会让后续排查方向变窄，反而误导。
+
+---
+
+### 丢弃/清理 item ID 会不会有副作用
+
+先区分两个动作：
+
+1. **清理非法 `id` 字段**：保留 item 本体，只去掉不合规的 `id`。
+2. **丢弃非法 reasoning item**：整个 reasoning item 被移除。
+
+#### 普通 message / function item：只去掉非法 ID，风险低
+
+例如上游返回：
+
+```json
+{
+  "type": "message",
+  "id": "item_xxx",
+  "role": "assistant",
+  "content": [...]
+}
+```
+
+Relay 会变成：
+
+```json
+{
+  "type": "message",
+  "role": "assistant",
+  "content": [...]
+}
+```
+
+内容没有丢，`role`、`content`、`call_id` 等关键字段仍保留。副作用主要是：Codex 或上游不能再引用这个错误的 `item_xxx` ID。
+
+但这个 ID 本来就不符合 Responses API 对该类型的前缀要求。保留它的副作用更大：它会污染 session 历史，导致后续 compact/replay 直接失败。
+
+所以对普通 message / function item，**去掉非法 ID 是低风险且必要的防火墙行为**。
+
+#### reasoning item：非法 ID 的 item 被丢弃，风险中等但可接受
+
+reasoning item 比普通消息特殊。它可能代表上游私有的内部推理状态，不只是展示文本。
+
+如果第三方上游返回：
+
+```json
+{
+  "type": "reasoning",
+  "id": "item_xxx",
+  "summary": [...],
+  "encrypted_content": "..."
+}
+```
+
+Relay 不会把 `item_xxx` 改成 `rs_xxx`，而是丢弃该 reasoning item。
+
+原因：
+
+- `reasoning.id` 可能和上游内部状态绑定，不是换个前缀就合法；
+- `encrypted_content` 往往只对特定 provider 有意义；
+- 伪造 `rs_...` 可能让严格上游误以为这是可恢复的官方 reasoning state，后续产生更隐蔽的问题；
+- reasoning item 通常不是用户可见内容，丢弃后主要损失的是“跨轮推理状态连续性”，不是业务正文。
+
+#### 可能损失什么
+
+丢弃非法 reasoning item 可能带来这些影响：
+
+- 下一轮模型少了一部分历史 reasoning state；
+- 对非常依赖 reasoning carry-over 的长任务，模型可能需要重新理解上下文；
+- token 使用可能略有上升，因为模型不能复用那段私有状态；
+- 如果某个上游真的依赖自己生成的 `item_xxx` reasoning state，清理后它的连续推理能力可能下降。
+
+#### 避免了什么
+
+清理/丢弃带来的收益更关键：
+
+- 避免 `invalid_id_prefix` 让整条请求失败；
+- 避免第三方 provider 的私有状态污染 Codex 本地 session；
+- 避免切回官方 OpenAI 或严格兼容上游时 compact 失败；
+- 避免把无法验证的第三方 encrypted reasoning 当成可恢复状态继续传递。
+
+#### 最终判断
+
+- **message / function item：去掉非法 ID，副作用很小，收益明确。**
+- **reasoning item：丢弃有一定连续性损失，但比伪造 ID 或保留坏 ID 更安全。**
+- 当前策略适合 Relay 的定位：它不是盲目透传器，而是 Codex 与多种 OpenAI-compatible 上游之间的协议防火墙。
+
+如果后续确认某个特定上游的 reasoning state 虽然 ID 不规范但确实可用，可以再做 deployment 级开关关闭 `drop_invalid_reasoning_items`。默认开启清理仍然更稳。
+
+## 16. Hard Test：区分普通 API 可用和 Codex-like 流式兼容（2026-08-23）
+
+### 背景
+
+普通 `Test` 请求只验证一件事：这个 deployment 能否完成一个短的非流式 Responses 请求。
+
+它的请求形态接近：
+
+```json
+{
+  "stream": false,
+  "input": "Reply with OK in one short sentence."
+}
+```
+
+所以它 3-5 秒返回 `OK`，只能证明 API key、base URL、model 名和基础非流式调用可用。
+
+Codex 真实调用更复杂：
+
+- `stream: true`；
+- 带工具定义；
+- 长 system/developer instructions；
+- session 历史 replay；
+- reasoning item；
+- function call / tool output；
+- 必须正确结束 SSE：`response.completed` / `response.failed` / `response.incomplete` / `[DONE]`。
+
+因此会出现“普通 Test 4 秒 OK，但 Codex 调用 120 秒 timeout”的情况。普通 Test 没覆盖 Codex 真正依赖的协议面。
+
+### 实现
+
+管理台每个 API 卡片新增 `Hard Test` 按钮。
+
+Hard Test 会直接对该 deployment 发一个 Codex-like probe：
+
+```json
+{
+  "stream": true,
+  "tools": [
+    {
+      "type": "function",
+      "name": "hard_test_echo"
+    }
+  ],
+  "input": "要求模型尽量调用 hard_test_echo，并正常结束流式响应"
+}
+```
+
+它会读取完整 SSE 流，并记录 diagnostics：
+
+- `terminal_detected`：是否看到 `response.completed` / `response.failed` / `response.incomplete` / `[DONE]`；
+- `failed_event_detected`：是否看到 failed/incomplete；
+- `done_marker_detected`：是否看到 `[DONE]`；
+- `tool_call_detected`：是否看到结构化工具调用迹象；
+- `first_chunk_ms`：首个 SSE chunk 延迟；
+- `chunks`：收到的 chunk 数；
+- `bytes`：响应体大小；
+- `content_type`：上游返回类型；
+- `timeout_ms`：本次 hard test 使用的超时时间。
+
+### 判定
+
+Hard Test 的核心判定不是“回答内容像不像 OK”，而是协议是否完成：
+
+1. HTTP 非 2xx：失败，按上游 HTTP 错误分类。
+2. SSE 没有 terminal event，也没有 `[DONE]`：失败，通常是 Codex 静默停止或 120s timeout 的高风险信号。
+3. SSE 返回 `response.failed` / `response.incomplete`：失败，说明上游明确没有完成。
+4. SSE 正常完成但没有检测到工具调用：通过，但带 warning：`streaming completed, but tool-calling compatibility is not proven`。
+5. SSE 正常完成且检测到工具调用：通过，说明该 deployment 更接近 Codex 所需能力。
+
+### 为什么工具调用不作为硬失败
+
+并不是所有模型都会在 probe 中选择调用工具；有些兼容层也可能把工具调用转换成文本。为了避免误杀，Hard Test 把“没有工具调用”记为 warning，而不是失败。
+
+真正必须失败的是：流式请求不能正常结束，或者上游明确 failed/incomplete。因为这正是 Codex 任务静默停止和 120 秒超时的主要风险。
+
+### 使用方式
+
+在网页管理台：
+
+```text
+APIs → 目标 deployment → Hard Test
+```
+
+结果弹窗里看 `diagnostics`：
+
+- `terminal_detected: false`：优先怀疑上游 SSE 不完整或流式超时；
+- `tool_call_detected: false`：普通流式可用，但工具调用兼容性没有被证明；
+- `first_chunk_ms` 很高：上游首包慢；
+- `chunks` 很少且最后 timeout：上游可能发了开头就卡住；
+- `content_type` 不是 `text/event-stream`：上游可能没有真正按 SSE 返回。
+
+### 验证
+
+新增回归测试：
+
+- Hard Test 会发送 `stream: true` 和 `tools`；
+- Hard Test 能识别 terminal event 和工具调用；
+- Hard Test 对永不结束的 SSE probe 返回 `upstream_timeout`。
+
+## 17. DeepSeek thinking 模式 `reasoning_text` 报错处理（2026-08-23）
+
+### 现象
+
+使用 DeepSeek deployment 时出现：
+
+```text
+The `reasoning_text` in the thinking mode must be passed back to the API.
+```
+
+本地日志中能看到 DeepSeek 的上一轮 Responses payload 会返回类似结构：
+
+```json
+{
+  "type": "reasoning",
+  "id": "非 rs_ 前缀的 provider 私有 ID",
+  "content": [
+    { "type": "reasoning_text", "text": "..." }
+  ],
+  "encrypted_content": "..."
+}
+```
+
+而 Relay 的默认防污染策略会丢弃非法 reasoning item，避免 `item_*`、UUID 等第三方私有 reasoning state 污染 Codex 历史。这个策略对 Modelgate/OpenAI-like 严格兼容路径是正确的，但会和 DeepSeek 的 thinking state 续写要求冲突。
+
+### 是否针对 Modelgate 硬编码
+
+没有针对 Modelgate 硬编码。当前兼容逻辑是通用的 Responses 协议防火墙：
+
+- 清理非法 item id；
+- 丢弃非法 reasoning item；
+- DSML tool call 转 function_call；
+- SSE 断流转 response.failed。
+
+真正的问题是：不同上游对 reasoning state 的要求不同。DeepSeek 在 thinking 模式下可能要求上一轮 `reasoning_text` 被带回；而 Relay 为了避免污染 Codex 历史，默认不保留第三方非法 reasoning item。
+
+### 修复
+
+新增 deployment 级兼容开关：
+
+```json
+{
+  "compatibility": {
+    "strip_previous_response_id": true
+  }
+}
+```
+
+含义：转发给该上游前删除 `previous_response_id`。
+
+这样 DeepSeek 不会继续绑定上一轮服务端 response state，也就不会要求 Relay 回传被清理掉的 `reasoning_text`。Codex 仍然会通过 `input` 历史携带可见上下文，只是不再依赖 DeepSeek 的 provider-side previous response continuation。
+
+已给 `deepseek-v1` deployment 启用该开关。
+
+### 取舍
+
+收益：
+
+- 避免 DeepSeek 因 missing `reasoning_text` 直接 400；
+- 保持 Relay 对非法 reasoning item 的默认防污染策略；
+- 不影响 Modelgate/OpenAI-like provider，它们仍可使用 `previous_response_id`。
+
+代价：
+
+- DeepSeek 上不能利用 provider-side previous response state；
+- 长上下文任务更多依赖 Codex replay 的显式历史；
+- 如果后续要完整支持 DeepSeek thinking state，需要单独实现 DeepSeek reasoning item 的安全保留/回传，而不能简单把第三方 reasoning item 透传给所有 provider。
+
+### 验证
+
+新增回归测试：
+
+- 显式配置 `strip_previous_response_id: true` 的 deployment 会删除 `previous_response_id`；
+- 未配置的普通 provider 不受影响，仍保留 `previous_response_id`。
+
+## 18. `X-OpenAI-Internal-Codex-Responses-Lite` 与 provider/model 混用（2026-08-23）
+
+### 现象
+
+会话 `01a024cc-d708-7e31-8ea8-c4d754bcf176` 在 rollout 行 `19520` 报错：
+
+```json
+{
+  "type": "invalid_request_error",
+  "code": "unsupported_value",
+  "message": "This model is not supported when using X-OpenAI-Internal-Codex-Responses-Lite.",
+  "param": "model"
+}
+```
+
+同一 turn 的设置显示：
+
+```text
+model_provider_id: openai
+model: gpt-5.5
+comp_hash: relay
+```
+
+本地 `~/.codex/state_5.sqlite` 中该 thread 也确认是：
+
+```text
+id = 01a024cc-d708-7e31-8ea8-c4d754bcf176
+model_provider = openai
+model = gpt-5.5
+```
+
+### 通俗解释
+
+`X-OpenAI-Internal-Codex-Responses-Lite` 是 Codex 客户端内部使用的 Responses Lite 路径 header。这个路径只支持一组特定的官方模型。
+
+但 `gpt-5.5` 在当前环境里是 Relay/Modelgate 侧使用的模型名，不是官方 OpenAI provider 在 Codex Lite 路径下可接受的模型。
+
+因此错误的实际含义是：
+
+> 这个 thread 仍然走 `openai` provider，却使用了 relay/modelgate 的 `gpt-5.5` 模型名；官方 OpenAI 的 Codex Lite 路径拒绝了这个组合。
+
+这不是上游 Modelgate 的错误，也不是 Relay 返回的错误；它发生在 Codex 直接走官方 `openai` provider 的路径上。
+
+### 修复
+
+已将该 thread 在 Codex 本地状态中的 provider 改回 relay：
+
+```sql
+UPDATE threads
+SET model_provider = 'relay'
+WHERE id = '01a024cc-d708-7e31-8ea8-c4d754bcf176';
+```
+
+修复前：
+
+```text
+('01a024cc-d708-7e31-8ea8-c4d754bcf176', 'openai', 'gpt-5.5')
+```
+
+修复后：
+
+```text
+('01a024cc-d708-7e31-8ea8-c4d754bcf176', 'relay', 'gpt-5.5')
+```
+
+### 后续注意
+
+如果以后再次看到这个错误，优先检查两处：
+
+```bash
+grep -n "model_provider\|model =" ~/.codex/config.toml
+sqlite3 ~/.codex/state_5.sqlite \
+  "select id, model_provider, model from threads where id='<thread_id>';"
+```
+
+只要是 `model_provider=openai` 搭配 relay-only 的模型名，例如 `gpt-5.5`，就会有类似风险。
+
+## 14. 调用详情 token 估算与 Summary 视图优化（2026-08-23）
+
+### 现象与原因
+
+某条调用详情显示 output tokens 为 2048，同时 total tokens 带有 EST 标记。这个数字不是上游真实 usage：当上游没有返回 usage 时，旧逻辑从流式响应最后保留的约 8192 个字符 streamTail 估算输出，按约 4 字符/token 计算后正好得到 8192 / 4 = 2048。
+
+streamTail 是为了诊断和终端事件判断保留的尾部缓存，不代表完整模型输出；尤其当上游响应混入很长的工具协议或上下文时，用它估算 token 会明显误导。
+
+### 修复
+
+- 新增流式 response.output_text.delta 提取器，按真实文本 delta 累积输出文本。
+- 流式 usage 缺失时优先使用完整文本 delta 估算，不再把固定长度的 SSE 尾部当作输出。
+- 兼容只返回 `response.output_item.done` 或 `response.completed.output` 的 provider；这类完整 message 文本单独累计，避免和 delta 重复计算。
+- 只有文本 delta、完整 message item 都无法提取时，才回退到原有 SSE 尾部逻辑，并继续标记为估算。
+- Summary 中 input/output/total token 均明确使用约等于符号和 EST 标记，并显示 estimated_reason，不再把估算数字表现为精确账单数据。
+- Summary 改为调用详情面板：顶部展示调用状态、deployment -> model 路径和耗时，中部使用三段 token strip，底部区分 Response Preview、Request Context、错误和诊断信息；JSON 视图保持可用。
+- Response Preview 仅在展示层把上游返回的字面量 `\\n`、`\\t` 转成可读换行和制表符；JSON 视图保留原始值，便于排查上游协议问题。
+
+### 验证
+
+新增回归测试使用 9000 字符的 SSE text delta，以及没有 delta、只有完整 message item 的两种流，均确认估算 output 为 2250，而不是由尾部缓存固定得到的 2048。
+
+## 15. Logs 路径、原始响应和分页修复（2026-08-23）
+
+### 需求
+
+本轮需要同时解决三个使用问题：
+
+- Overview、Logs 和 API 页面中的大数字需要使用千位分隔符；
+- Logs 需要显示 Codex rollout 文件路径，并允许查看上游完整原始响应；
+- 日志列表分页在自动刷新、快速点击和刷新配置后不能跳回旧页或被旧请求覆盖。
+
+### 设计
+
+1. 日志列表继续只返回状态、模型、耗时、token 摘要和文件引用，不把完整上游响应塞入 /admin/calls，避免列表响应和浏览器 DOM 随响应体增长。
+2. 每次成功或失败的上游响应在转发结束后写入本地受保护目录，文件使用 0600，目录使用 0700。文件保存原始响应文本、content type 和是否流式，不保存 API key。
+3. 新增 GET /admin/calls/:raw_id/raw。只有点击详情的 JSON 页签时，前端才请求这个接口；流式响应按原始 SSE 文本展示，普通 JSON 先解析后格式化展示。
+4. 请求会从 body、常见 Codex thread header 和 JSON metadata header 中提取 thread ID，再通过 ~/.codex/state_5.sqlite 查询 threads.rollout_path。未识别到 thread ID 时明确显示 rollout · not identified，不根据“最近会话”猜路径。
+5. /admin/calls 现在返回 page 和 total_pages。状态层会把超出范围的 offset 规整到最后一页；前端使用请求序列号和 loading 状态，自动刷新返回旧数据时不会覆盖用户刚切换的页。
+
+### 遇到的问题和处理
+
+- 原来详情 JSON 只是 runtime call 对象，不是上游原始 JSON。现在列表与原始响应解耦，旧日志仍能查看 metadata，新日志才提供完整 raw response。
+- 流式转发过程中只保留了用于诊断的 streamTail，不能拿它代表完整响应。新增独立的原始流缓冲，只在落盘阶段使用，不参与 token 估算和列表渲染。
+- 前端分页原先根据本地 logPage 和旧数组自行推导状态；自动刷新或多个请求同时返回时会出现页面错位。现在以后端返回的 page/total_pages 为准，并丢弃过期请求。
+- rollout 路径不是每个 Responses 请求都带有公开的 thread ID。错误猜测比显示未识别更危险，因此只接受明确可关联的 ID。
+
+### 验证
+
+- npm run check 通过。
+- npm test 通过，包含 raw response 按需读取和 thread header 记录测试。
+- 新增测试确认完整的上游字段不出现在 /admin/calls 列表，只能通过 raw 接口按需读取。
+
+## 19. 最近活跃 Session 与 RPM 看板（2026-08-23）
+
+### 需求
+
+本轮增加一个 Sessions 工作区，用于查看最近活跃的 Codex session、该 session 关联的 Relay 请求、RPM、token 汇总和最近请求详情。页面需要支持多个关键词搜索、默认最近排序、分页和自动刷新。
+
+### 设计
+
+1. Session 元数据来自 `~/.codex/state_5.sqlite` 的 `threads` 表，包含 `id`、标题、预览、工作目录、模型、provider、reasoning effort 和 rollout 路径。
+2. Relay 请求来自当前 profile 的持久化 `recent_calls`，只按明确写入的 `thread_id` 关联。没有 thread ID 的调用计入 `unlinked_calls`，不会根据最近时间或最近 thread 猜测归属。
+3. 新增 `GET /admin/sessions`，支持 `q`、`sort`、`window`、`offset` 和 `limit`。列表只返回 session 摘要和最近 8 条调用摘要；点击 session 后可以查看最近请求，再复用已有 Call Detail 的 Summary/JSON 详情。
+4. 搜索词按空白切分，所有词都必须命中同一个 session 的可搜索字段。字段包括 session ID、标题、预览、首条用户消息、目录、provider、模型、reasoning、rollout 路径，以及最近请求的 request ID、deployment 和模型信息。
+
+### RPM 口径
+
+主指标使用固定时间窗口：
+
+```text
+RPM = requests_in_last_window / window_minutes
+```
+
+默认窗口为 15 分钟，也可切换 5 分钟和 60 分钟。固定窗口的优点是跨 session 可比较，并且单次请求只会显示 `1 / 15 = 0.07 RPM`，不会把一次请求夸大成无限高的速率。
+
+详情中另显示 `observed RPM`，用于描述已记录请求之间的密度：请求数为 1 时显示 0；请求数大于 1 时，使用首尾请求时间跨度，并将最小观测区间限制为 1 分钟。它适合观察短时间 burst，但不作为主比较指标。
+
+### 遇到的问题和处理
+
+- SQLite 不存在、没有 `sqlite3` 命令或 `threads` 表不可读时，接口仍返回由明确 `thread_id` 产生的 Relay-linked sessions，并在界面提示元数据不可用。
+- 初版合并调用时把 fallback 的 `Relay-linked session` 标题覆盖了 SQLite 中真实的 session 标题。修复为只有在 session 没有标题时才使用 fallback，避免搜索和展示丢失 Codex 元数据。
+- 自动刷新期间用户可能正在输入搜索词。现在刷新不会覆盖当前聚焦的输入框；搜索、排序和窗口变化仍然显式触发新的查询。
+- Sessions 请求增加请求序列保护，旧的自动刷新响应不能覆盖新搜索或新分页结果。当前页、搜索词、排序和窗口会保存在浏览器本地状态中。
+
+### 验证
+
+- 新增集成测试验证 SQLite threads 与 Relay calls 的合并、rollout 路径、多个关键词 AND 搜索、未关联调用计数、固定窗口 RPM 和分页字段。
+- `npm test` 通过，共 59 个测试。
+- `npm run check` 通过。
+- 管理台生成后的 inline script 通过 `new Function` 语法检查。
+
+## 20. 网页端停止 Relay 服务与后台启动脚本（2026-08-23）
+
+### 需求
+
+用户希望不再回到终端执行停止操作，而是在网页管理台中直接关闭本地中转站。
+
+### 设计
+
+- 新增受保护的 `POST /admin/shutdown`。
+- 只允许通过 `adminContext` 鉴权的请求；本机管理员、远程管理员和登录账号都可以执行，未登录请求仍返回 401。
+- 返回 `202 shutting_down` 后，服务使用 `server.close()` 停止接收新连接，并关闭空闲连接；当前请求完成后释放监听端口。
+- 管理台在认证成功后显示 `Stop Relay`，点击后需要浏览器二次确认，成功后禁用控件并提示使用 `npm run start:background` 恢复服务。
+- 新增 `scripts/start-relay.sh` 和 `npm run start:background`，支持 PID 文件、日志文件、重复启动保护和端口冲突失败提示。
+- 后续脚本验证发现自定义端口仍打印固定的 `8787`，已改为从启动日志读取真实监听地址；PID 文件命中时也会核对进程命令行，降低 PID 复用造成误判的风险。
+
+### 遇到的问题和处理
+
+之前直接执行 `kill -TERM <node-pid>` 时，macOS `launchd` 的 `keepalive` 会自动重新拉起 Relay。网页按钮只负责停止当前 HTTP 服务；如果用户另外配置了 launchd、Docker 或其他进程管理器，管理器仍可能按照自己的策略重启它。后台脚本同样不接管外部进程管理器，只负责启动一个独立 Node 进程。
+
+初版页面用 `profile.kind` 判断是否显示停止按钮，导致 Guest 管理员（包括远程管理员）在刷新配置后被误判为不可关闭。修复为在管理鉴权成功的响应中返回独立的 `can_shutdown` 能力字段；身份是 Guest 还是 account 不再决定是否有关闭权限。
+
+### 验证
+
+- 未授权请求返回 401。
+- 管理员和账号请求返回 202，随后 HTTP server 不再监听端口。
+- `npm run check`、`npm test` 和管理台 inline script 检查通过。
+
+## 21. Logs 翻页递归与 Sessions 空列表修复（2026-08-23）
+
+### 现象
+
+- Logs 接口已经返回多页，但网页端点击 `Next`、`Prev` 后没有正常切换。
+- Sessions 页面显示空列表，统计值保持为 0。
+
+### 定位
+
+通过浏览器实际点击 Sessions 后读取控制台错误，确认错误为：
+
+```text
+RangeError: Maximum call stack size exceeded
+at window.loadSessions (...)
+```
+
+页面底部把内部函数再次暴露为同名的 `window.loadSessions`：
+
+```js
+window.loadSessions = (page) => loadSessions(page).catch(...)
+```
+
+浏览器解析后，包装函数中的 `loadSessions` 也指向了 `window.loadSessions`，形成无限递归。Logs 使用了同样的命名模式，因此分页按钮虽然可见，但点击后请求没有完成。
+
+### 实现
+
+1. 将内部请求函数改为 `requestLogPage` 和 `requestSessions`，保留 `window.loadLogPage`、`window.loadSessions` 作为稳定的 HTML 事件入口，避免名称覆盖。
+2. Logs 增加 `logPageLoaded` 状态。服务端返回合法空页时，页面保持空页，不再因为 `logCalls.length === 0` 回退显示旧的 `runtimeStatus.recent_calls`。
+3. Sessions 读取 `threads.tokens_used`。即使 Relay 调用没有明确的 `thread_id`，只要 Codex SQLite 中保存了该 session 的 token 使用量，页面仍会显示它。
+4. Sessions 返回 `codex_total_tokens`、`relay_total_tokens` 和 `token_source`。来源可显示为 `codex_sqlite`、`relay_usage` 或 `both`，避免用户误把两个来源混为一次调用。
+5. Session 卡片增加 token 来源提示，便于区分 Codex 持久化统计和 Relay 当前 profile 的调用统计。
+
+### 验证
+
+- 浏览器验证 Sessions 能显示真实 Codex session、模型、rollout 路径及 token 来源。
+- 浏览器验证 Logs 从 `Page 1/25 · 1-20 of 500` 切换到 `Page 2/25 · 21-40 of 500`，列表内容随页面改变。
+- `npm test` 通过，共 62 个测试；新增测试覆盖“无 Relay 关联调用但有 SQLite token 使用量”的 session。
+- `npm run check` 通过。
+- `git diff --check` 通过。
