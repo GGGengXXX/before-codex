@@ -27,6 +27,7 @@
 - 网页端 Secrets 管理，避免把真实密钥写入配置
 - 网页端账号管理，支持 Guest、注册、登录、退出、设置默认账号和删除账号
 - 经过管理鉴权的用户可在网页端二次确认后停止 Relay 服务
+- 手机局域网工作台：`/mobile` 使用已有多用户账号密码登录，共享该账号的 API 状态，发现本机 Codex sessions，并可为选定 session 启动长驻 `codex app-server` 后台进程；仍支持一次性 `app-server` / `exec` run
 
 ## 快速开始
 
@@ -49,6 +50,7 @@ npm run start:background
 
 - 状态页：<http://127.0.0.1:8787/>
 - 管理控制台：<http://127.0.0.1:8787/admin>
+- 手机工作台：<http://127.0.0.1:8787/mobile>
 - 健康检查：<http://127.0.0.1:8787/healthz>
 - 就绪检查：<http://127.0.0.1:8787/readyz>
 - 模型列表：`GET http://127.0.0.1:8787/v1/models`
@@ -96,6 +98,34 @@ CLI 使用上下键移动高亮项、Enter 进入、Esc 返回；API 表单支�
 密码不会明文保存，只保存 scrypt hash。Codex auth command 会优先读取当前终端的登录 session；执行 `Set default` 后，没有当前 session 的终端会使用默认账号；如果两者都没有，则使用 `.env` 里的 `RELAY_API_KEY` 作为 Guest。Guest 使用项目根目录的 `config.json` 和默认状态文件，登录用户使用 `~/.codex-relay/users/<username>/` 下的独立配置和状态。
 
 注意：这是同一个操作系统账号下的应用层隔离。拥有该 macOS/Linux 账号文件读取权限的人，理论上仍能读取本地 profile 文件；需要更强隔离时，应使用不同操作系统用户或系统 Keychain。
+
+## 手机局域网工作台
+
+已有账号后，可以用手机访问轻量工作台：
+
+```text
+http://电脑局域网IP:8787/mobile
+```
+
+如果需要让手机直接访问，把 `config.json` 的 `server.host` 改为 `0.0.0.0` 或电脑的局域网 IP，然后重启 Relay。手机端使用已有用户名和密码登录，不开放注册入口；注册仍建议在电脑本机 `/admin` 或 CLI 完成。
+
+手机端会显示当前账号的 API 健康状态、deployment 状态和模型列表，不会返回真实 API Key。`Sessions` 页会读取电脑上的 Codex thread 记录；点选一条 session 后，Relay 会在电脑上启动一个长驻 `codex app-server --stdio` 后台进程并 `thread/resume` 到该 session。之后手机上的命令会发送到这个后台进程，电脑执行后把事件流和最终回复返回到手机页面。
+
+`Quick` 页仍保留一次性任务：默认通过本机 `codex app-server --stdio` 执行单个 turn，并由 Relay 把 app-server 事件转成手机浏览器的 SSE；也可以在页面里切回 `exec` fallback。默认工作区由 `lan_control.workspace_roots` 限制，默认同一用户只允许一个运行中的一次性任务：
+
+```json
+{
+  "lan_control": {
+    "workspace_roots": ["."],
+    "max_active_runs_per_user": 1,
+    "execution_backend": "app-server",
+    "default_sandbox": "workspace-write",
+    "app_server_approval_policy": "never"
+  }
+}
+```
+
+默认 `app_server_approval_policy` 是 `never`，手机端会少看到审批提示；如果希望把 app-server 的命令或文件变更审批交给手机处理，可以改成 `on-request`，详情区会显示 `Accept`、`Decline` 和 `Cancel` 按钮。Relay 不会把 app-server 原始端口暴露到局域网，只暴露带账号密码登录的 `/mobile` 网页和配套 API。
 
 ## 配置热加载
 

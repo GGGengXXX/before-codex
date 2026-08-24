@@ -1,6 +1,6 @@
 # Codex Relay 实现过程记录
 
-最后更新：2026-08-21
+最后更新：2026-08-24
 
 这是一份过程性文档，不只记录最终代码，也记录实现时的设计判断、取舍、Bug 和验证结果。后续每次改变路由、协议兼容性或状态存储方式，都应该继续追加到这里。
 
@@ -382,6 +382,34 @@ admin-secret      -> secret:server:admin_api_key
 - JSON：完整编辑原始配置，覆盖高级路由、cooldown、provider error rules、state 后端等详细配置。
 
 “Only This” 操作用来快速只启用某一个 API；普通 Enable/Disable 则适合保留多个 API 作为 failover 池。
+
+### 阶段九：多用户注销与 token 撤销
+
+用户反馈了一个很关键的同机多用户风险：用户 A 登录并配置 API 后，如果只是在前端或 CLI 清掉本地显示状态，下一个使用机器的人仍可能通过旧 token、终端 session 文件或默认账号继续使用用户 A 的 API。
+
+本阶段把 `logout` 从“清除本地 UI/session”升级为真正的安全边界：
+
+- `AccountStore.logout()` 会清除当前终端 session；
+- 如果注销账号正好是免登录默认账号，会同步清除 `default_username` 和所有 `is_default` 标记；
+- 注销时轮换账号 `api_token`，让已经暴露给 Codex、网页端或手机端的旧 bearer token 立即失效；
+- 网页端 `Logout` 调用 `POST /admin/account/logout`，后端成功后才清理浏览器 `localStorage`；
+- 手机端 `Logout` 调用 `POST /mobile/logout`，避免手机上的旧 token 留存可用；
+- CLI 的 `npm run cli logout` 和交互式 `Account & session -> Logout` 都走同一套 `AccountStore.logout()`。
+
+这里有一个容易漏掉的边界：`scripts/relay-token.mjs` 是 Codex 真正启动请求时读取 bearer token 的入口。之前它的顺序是“当前终端 session -> 默认账号 -> Guest `.env` token”。现在如果 session 文件存在但 token 已经被撤销，它会认为这是一个失效的显式登录状态，直接提示重新登录，而不是回退到默认账号。这样可以避免用户 A 注销后，用户 B 在同一个终端里无感继承某个默认账号。
+
+设计取舍：当前账号模型每个用户只有一个 `api_token`，所以注销会让该账号在其他已登录终端里的旧 token 一并失效。这比只清当前浏览器更严格，但符合“同一台电脑多人使用时，退出后不能继续用这个人的 API”的安全预期。后续如果需要“只注销当前设备、不影响其他设备”，可以把账号 token 拆成多条命名 session token，并在账号记录里维护 token 列表和设备来源。
+
+### 阶段十：Global / Terminal 作用域
+
+第一阶段没有引入 PID 级 Process scope，而是使用已有的终端 session 标识作为 Terminal scope。网页管理台新增作用域栏：
+
+- `Global`：设置或清除全局默认账号。没有显式终端 session 的 Codex 会使用这个账号；清除后回到 Guest；
+- `Terminal`：把当前网页选择的 Guest 或账号绑定到输入的 `session_id`。Codex 的 `relay-token.mjs` 在对应终端里会优先命中这个绑定；
+- Guest 的 Terminal 绑定使用一个明确的 guest marker，因此不会因为机器上存在另一个默认账号而错误继承它；
+- `Save + Reload` 会连同当前选择的作用域一起提交，`Apply Scope` 可以只修改绑定关系而不保存配置。
+
+这里的 `session_id` 对应 `RELAY_SESSION_ID`、`ITERM_SESSION_ID`、`TERM_SESSION_ID` 或 `WT_SESSION`。网页进程无法自动读取打开它的 shell 环境，所以网页端允许手工填写，也会把已有 session 列在下拉提示中。当前阶段仍然是账号级配置：Terminal scope 改变的是“这个终端使用谁”，不是为同一个账号创建一份独立 API 配置副本。
 
 ## 6. 遇到的 Bug 和修复
 

@@ -24,6 +24,7 @@ import { errorPayload, RelayError } from "./errors.js";
 import { Router } from "./router.js";
 import { createRawResponseStore } from "./raw-store.js";
 import { createRuntimeState } from "./state.js";
+import { MobileJobManager, MobileSessionProcessManager } from "./mobile-control.js";
 import {
   callUpstream,
   compatibilityForDeployment,
@@ -44,6 +45,7 @@ import {
   synthesizeResponseFailedSse
 } from "./upstream.js";
 import { renderAdminPage } from "./admin-page.js";
+import { renderMobilePage } from "./mobile-page.js";
 import { renderStatusPage } from "./status-page.js";
 
 const execFileAsync = promisify(execFile);
@@ -126,6 +128,24 @@ function publicStatus(config, state, options = {}) {
     deployments: state.snapshot(deployments, options),
     recent_calls: state.recentCalls?.(20) ?? [],
     usage: state.usageSummary?.() ?? null
+  };
+}
+
+function mobileOptionsFromConfig(config) {
+  const mobile = config.lan_control ?? {};
+  return {
+    workspaceRoots: mobile.workspace_roots,
+    maxActiveRunsPerUser: mobile.max_active_runs_per_user,
+    maxPromptChars: mobile.max_prompt_chars,
+    maxEventsPerJob: mobile.max_events_per_job,
+    maxJobs: mobile.max_jobs,
+    defaultSandbox: mobile.default_sandbox,
+    defaultModel: mobile.default_model,
+    skipGitRepoCheck: mobile.skip_git_repo_check,
+    defaultBackend: mobile.execution_backend,
+    appServerApprovalPolicy: mobile.app_server_approval_policy,
+    appServerApprovalsReviewer: mobile.app_server_approvals_reviewer,
+    codexBin: mobile.codex_bin
   };
 }
 
@@ -1470,11 +1490,16 @@ export function createRelayServer(
     codexConfigPath = defaultCodexConfigPath(),
     codexStatePath = defaultCodexStatePath(),
     accountStore = new AccountStore(),
-    rawResponseDir = null
+    rawResponseDir = null,
+    mobileJobManager = null,
+    mobileSessionProcessManager = null
   } = {}
 ) {
   const router = new Router(config, state);
   const rawStore = createRawResponseStore(rawResponseDirectory(config, configPath, rawResponseDir));
+  const mobileJobs = mobileJobManager ?? new MobileJobManager(mobileOptionsFromConfig(config));
+  const mobileSessionProcesses = mobileSessionProcessManager
+    ?? new MobileSessionProcessManager(mobileOptionsFromConfig(config));
   let lastReloadAt = null;
   let reloadPromise = null;
 
@@ -1538,6 +1563,38 @@ export function createRelayServer(
     return null;
   }
 
+  async function mobileAccount(req) {
+    const account = await accountStore.authenticateToken(bearerToken(req));
+    return account || null;
+  }
+
+  async function requireMobileAccount(req, requestIdValue) {
+    const account = await mobileAccount(req);
+    if (!account) {
+      throw new RelayError("Account bearer token required", {
+        code: "unauthorized",
+        status: 401,
+        request_id: requestIdValue
+      });
+    }
+    return account;
+  }
+
+  function mobileAccountPayload(account) {
+    return {
+      username: account.username,
+      config_path: account.config_path,
+      state_path: account.state_path,
+      is_default: Boolean(account.is_default)
+    };
+  }
+
+  function writeSseEvent(res, event) {
+    res.write(`id: ${event.sequence}\n`);
+    res.write(`event: ${event.type}\n`);
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  }
+
   async function reload() {
     if (!configPath) {
       throw new RelayError("This server was not started with a reloadable config path", {
@@ -1550,6 +1607,8 @@ export function createRelayServer(
         try {
           const nextConfig = await loadConfigFn(configPath);
           replaceConfig(config, nextConfig);
+          mobileJobs.updateOptions(mobileOptionsFromConfig(config));
+          mobileSessionProcesses.updateOptions(mobileOptionsFromConfig(config));
           lastReloadAt = new Date().toISOString();
           return {
             reloaded_at: lastReloadAt,
@@ -1584,8 +1643,65 @@ export function createRelayServer(
       config: redactConfigSecrets(rawConfig),
       status: publicStatus(context.config, context.state, { includeEndpoint: true }),
       env: await envPayload(rawConfig, context),
-      codex: await readCodexConfig(codexConfigPath)
+      codex: await readCodexConfig(codexConfigPath),
+      scope: await scopePayload()
     };
+  }
+
+  async function scopePayload() {
+    const data = await accountStore.read();
+    return {
+      global: {
+        kind: data.default_username ? "account" : "guest",
+        username: data.default_username ?? null
+      },
+      sessions: await accountStore.listSessions()
+    };
+  }
+
+  async function applyScope(context, value = {}) {
+    const { mode, sessionId } = validateScope(value);
+    if (mode === "global") {
+      if (context.account) {
+        await accountStore.setDefault(context.account.username);
+      } else {
+        await accountStore.clearDefault();
+      }
+    } else if (context.account) {
+      await accountStore.setSessionKey(context.account, sessionId);
+    } else {
+      await accountStore.setGuestSession(sessionId);
+    }
+    const data = await accountStore.read();
+    return {
+      mode,
+      session_id: mode === "terminal" ? sessionId : null,
+      kind: context.account ? "account" : "guest",
+      username: context.account?.username ?? null,
+      global: {
+        kind: data.default_username ? "account" : "guest",
+        username: data.default_username ?? null
+      },
+      sessions: await accountStore.listSessions()
+    };
+  }
+
+  function validateScope(value = {}) {
+    const mode = String(value.mode ?? value.scope ?? "global").trim().toLowerCase();
+    if (!["global", "terminal"].includes(mode)) {
+      throw new RelayError('Scope must be either "global" or "terminal"', {
+        code: "invalid_scope",
+        status: 400
+      });
+    }
+    const sessionId = String(value.session_id ?? "").trim();
+    if (mode === "terminal" && !sessionId) {
+      throw new RelayError("A terminal session ID is required for Terminal scope", {
+        code: "session_id_required",
+        status: 400
+      });
+    }
+    return { mode, sessionId };
   }
 
   async function envPayload(rawConfig = null, context = guestContext()) {
@@ -1623,6 +1739,8 @@ export function createRelayServer(
       const result = await writeValidatedConfig(context.configPath, nextConfig, loadConfigFn);
       if (context.kind === "guest") {
         replaceConfig(config, result.config);
+        mobileJobs.updateOptions(mobileOptionsFromConfig(config));
+        mobileSessionProcesses.updateOptions(mobileOptionsFromConfig(config));
         lastReloadAt = new Date().toISOString();
       } else {
         context.config = result.config;
@@ -2043,6 +2161,308 @@ export function createRelayServer(
         res.end(html);
         return;
       }
+      if (req.method === "GET" && url.pathname === "/mobile") {
+        const html = renderMobilePage();
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "content-length": Buffer.byteLength(html)
+        });
+        res.end(html);
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/mobile/login") {
+        const body = await readRequestBody(req, config.server.max_body_bytes);
+        let record;
+        try {
+          record = await accountStore.authenticatePassword(body.username, body.password);
+        } catch (error) {
+          throw new RelayError("Invalid username or password", {
+            code: "invalid_credentials",
+            status: 401,
+            cause: error
+          });
+        }
+        jsonResponse(res, 200, {
+          profile: profilePayload("account", record, record.config_path),
+          account: mobileAccountPayload(record),
+          api_token: record.api_token
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/mobile/logout") {
+        const account = await accountStore.authenticateToken(bearerToken(req));
+        if (!account) {
+          jsonResponse(res, 401, {
+            error: { type: "unauthorized", message: "Account bearer token required", request_id: id }
+          });
+          return;
+        }
+        await accountStore.logout(account, process.env, { clearSession: false });
+        jsonResponse(res, 200, {
+          status: "logged_out",
+          profile: profilePayload("guest", null, configPath),
+          token_revoked: true
+        });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/mobile/api/me") {
+        const account = await requireMobileAccount(req, id);
+        jsonResponse(res, 200, {
+          profile: profilePayload("account", account, account.config_path),
+          account: mobileAccountPayload(account),
+          active_jobs: mobileJobs.activeJobsFor(account.username).length,
+          active_session_processes: mobileSessionProcesses.activeProcessesFor(account.username).length,
+          options: mobileJobs.optionsPayload()
+        });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/mobile/api/status") {
+        const account = await requireMobileAccount(req, id);
+        const context = await contextForAccount(account);
+        jsonResponse(res, 200, {
+          profile: profilePayload("account", account, account.config_path),
+          account: mobileAccountPayload(account),
+          ...publicStatus(context.config, context.state, { includeEndpoint: true }),
+          models: Object.keys(context.config.models)
+        });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/mobile/api/sessions") {
+        const account = await requireMobileAccount(req, id);
+        const context = await contextForAccount(account);
+        const pagination = paginationFromUrl(url);
+        const sessions = await sessionActivityPayload({
+          state: context.state,
+          statePath: codexStatePath,
+          search: url.searchParams.get("q") ?? "",
+          sort: url.searchParams.get("sort") ?? "recent",
+          limit: pagination.limit,
+          offset: pagination.offset,
+          windowMinutes: url.searchParams.get("window") ?? 15
+        });
+        jsonResponse(res, 200, {
+          ...sessions,
+          processes: mobileSessionProcesses.listProcesses(account.username)
+        });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/mobile/api/session-processes") {
+        const account = await requireMobileAccount(req, id);
+        jsonResponse(res, 200, {
+          processes: mobileSessionProcesses.listProcesses(account.username)
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/mobile/api/session-processes") {
+        const account = await requireMobileAccount(req, id);
+        const body = await readRequestBody(req, config.server.max_body_bytes);
+        const relaySessionId = `mobile-${account.username}`;
+        await accountStore.setSession(account, { RELAY_SESSION_ID: relaySessionId });
+        const process = mobileSessionProcesses.startProcess(account.username, {
+          ...body,
+          relay_session_id: relaySessionId
+        });
+        jsonResponse(res, 201, process);
+        return;
+      }
+      const mobileSessionCommandMatch = req.method === "POST"
+        ? url.pathname.match(/^\/mobile\/api\/session-processes\/([^/]+)\/commands$/)
+        : null;
+      if (mobileSessionCommandMatch) {
+        const account = await requireMobileAccount(req, id);
+        const body = await readRequestBody(req, config.server.max_body_bytes);
+        const processId = decodeURIComponent(mobileSessionCommandMatch[1]);
+        const process = await mobileSessionProcesses.sendCommand(
+          account.username,
+          processId,
+          body.prompt
+        );
+        jsonResponse(res, 200, process);
+        return;
+      }
+      const mobileSessionInterruptMatch = req.method === "POST"
+        ? url.pathname.match(/^\/mobile\/api\/session-processes\/([^/]+)\/interrupt$/)
+        : null;
+      if (mobileSessionInterruptMatch) {
+        const account = await requireMobileAccount(req, id);
+        const processId = decodeURIComponent(mobileSessionInterruptMatch[1]);
+        jsonResponse(res, 200, mobileSessionProcesses.interruptProcess(account.username, processId));
+        return;
+      }
+      const mobileSessionStopMatch = req.method === "POST"
+        ? url.pathname.match(/^\/mobile\/api\/session-processes\/([^/]+)\/stop$/)
+        : null;
+      if (mobileSessionStopMatch) {
+        const account = await requireMobileAccount(req, id);
+        const processId = decodeURIComponent(mobileSessionStopMatch[1]);
+        jsonResponse(res, 200, mobileSessionProcesses.stopProcess(account.username, processId));
+        return;
+      }
+      const mobileSessionApprovalMatch = req.method === "POST"
+        ? url.pathname.match(/^\/mobile\/api\/session-processes\/([^/]+)\/approvals\/([^/]+)$/)
+        : null;
+      if (mobileSessionApprovalMatch) {
+        const account = await requireMobileAccount(req, id);
+        const body = await readRequestBody(req, config.server.max_body_bytes);
+        const processId = decodeURIComponent(mobileSessionApprovalMatch[1]);
+        const approvalId = decodeURIComponent(mobileSessionApprovalMatch[2]);
+        const process = mobileSessionProcesses.resolveApproval(
+          account.username,
+          processId,
+          approvalId,
+          body.decision
+        );
+        jsonResponse(res, 200, process);
+        return;
+      }
+      const mobileSessionEventsMatch = req.method === "GET"
+        ? url.pathname.match(/^\/mobile\/api\/session-processes\/([^/]+)\/events$/)
+        : null;
+      if (mobileSessionEventsMatch) {
+        const account = await requireMobileAccount(req, id);
+        const processId = decodeURIComponent(mobileSessionEventsMatch[1]);
+        const after = Math.max(0, Number(url.searchParams.get("after")) || 0);
+        const process = mobileSessionProcesses.getProcess(account.username, processId);
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          "connection": "keep-alive",
+          "x-accel-buffering": "no"
+        });
+        res.write(`: mobile session process ${process.id}\n\n`);
+        for (const event of process.events.filter((item) => item.sequence > after)) {
+          writeSseEvent(res, event);
+        }
+        if (["failed", "stopped"].includes(process.status)) {
+          res.end();
+          return;
+        }
+        const unsubscribe = mobileSessionProcesses.subscribe(account.username, processId, (event) => {
+          if (res.destroyed) {
+            unsubscribe();
+            return;
+          }
+          writeSseEvent(res, event);
+          if (["session_stopped", "session_failed"].includes(event.type)) {
+            setTimeout(() => {
+              unsubscribe();
+              if (!res.destroyed) {
+                res.end();
+              }
+            }, 25);
+          }
+        });
+        req.on("close", unsubscribe);
+        return;
+      }
+      const mobileSessionMatch = req.method === "GET"
+        ? url.pathname.match(/^\/mobile\/api\/session-processes\/([^/]+)$/)
+        : null;
+      if (mobileSessionMatch) {
+        const account = await requireMobileAccount(req, id);
+        const processId = decodeURIComponent(mobileSessionMatch[1]);
+        jsonResponse(res, 200, mobileSessionProcesses.processPayload(
+          mobileSessionProcesses.getProcess(account.username, processId)
+        ));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/mobile/api/jobs") {
+        const account = await requireMobileAccount(req, id);
+        jsonResponse(res, 200, {
+          jobs: mobileJobs.listJobs(account.username)
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/mobile/api/jobs") {
+        const account = await requireMobileAccount(req, id);
+        const body = await readRequestBody(req, config.server.max_body_bytes);
+        const relaySessionId = `mobile-${account.username}`;
+        await accountStore.setSession(account, { RELAY_SESSION_ID: relaySessionId });
+        const job = mobileJobs.startJob(account.username, {
+          ...body,
+          relay_session_id: relaySessionId
+        });
+        jsonResponse(res, 201, job);
+        return;
+      }
+      const mobileJobInterruptMatch = req.method === "POST"
+        ? url.pathname.match(/^\/mobile\/api\/jobs\/([^/]+)\/interrupt$/)
+        : null;
+      if (mobileJobInterruptMatch) {
+        const account = await requireMobileAccount(req, id);
+        const jobId = decodeURIComponent(mobileJobInterruptMatch[1]);
+        const job = mobileJobs.interruptJob(account.username, jobId);
+        jsonResponse(res, 200, job);
+        return;
+      }
+      const mobileApprovalMatch = req.method === "POST"
+        ? url.pathname.match(/^\/mobile\/api\/jobs\/([^/]+)\/approvals\/([^/]+)$/)
+        : null;
+      if (mobileApprovalMatch) {
+        const account = await requireMobileAccount(req, id);
+        const body = await readRequestBody(req, config.server.max_body_bytes);
+        const jobId = decodeURIComponent(mobileApprovalMatch[1]);
+        const approvalId = decodeURIComponent(mobileApprovalMatch[2]);
+        const job = mobileJobs.resolveApproval(
+          account.username,
+          jobId,
+          approvalId,
+          body.decision
+        );
+        jsonResponse(res, 200, job);
+        return;
+      }
+      const mobileJobEventsMatch = req.method === "GET"
+        ? url.pathname.match(/^\/mobile\/api\/jobs\/([^/]+)\/events$/)
+        : null;
+      if (mobileJobEventsMatch) {
+        const account = await requireMobileAccount(req, id);
+        const jobId = decodeURIComponent(mobileJobEventsMatch[1]);
+        const after = Math.max(0, Number(url.searchParams.get("after")) || 0);
+        const job = mobileJobs.getJob(account.username, jobId);
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          "connection": "keep-alive",
+          "x-accel-buffering": "no"
+        });
+        res.write(`: mobile job ${job.id}\n\n`);
+        for (const event of job.events.filter((item) => item.sequence > after)) {
+          writeSseEvent(res, event);
+        }
+        if (!["queued", "running", "cancelling"].includes(job.status)) {
+          res.end();
+          return;
+        }
+        const unsubscribe = mobileJobs.subscribe(account.username, jobId, (event) => {
+          if (res.destroyed) {
+            unsubscribe();
+            return;
+          }
+          writeSseEvent(res, event);
+          if (["job_completed", "job_failed", "job_cancelled"].includes(event.type)) {
+            setTimeout(() => {
+              unsubscribe();
+              if (!res.destroyed) {
+                res.end();
+              }
+            }, 25);
+          }
+        });
+        req.on("close", unsubscribe);
+        return;
+      }
+      const mobileJobMatch = req.method === "GET"
+        ? url.pathname.match(/^\/mobile\/api\/jobs\/([^/]+)$/)
+        : null;
+      if (mobileJobMatch) {
+        const account = await requireMobileAccount(req, id);
+        const jobId = decodeURIComponent(mobileJobMatch[1]);
+        jsonResponse(res, 200, mobileJobs.jobPayload(
+          mobileJobs.getJob(account.username, jobId)
+        ));
+        return;
+      }
       if (req.method === "GET" && url.pathname === "/healthz") {
         jsonResponse(res, 200, { status: "ok", request_id: id });
         return;
@@ -2093,6 +2513,22 @@ export function createRelayServer(
             is_default: Boolean(record.is_default)
           },
           api_token: record.api_token
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/admin/account/logout") {
+        const account = await accountStore.authenticateToken(bearerToken(req));
+        if (!account) {
+          jsonResponse(res, 401, {
+            error: { type: "unauthorized", message: "Account bearer token required", request_id: id }
+          });
+          return;
+        }
+        await accountStore.logout(account, process.env, { clearSession: false });
+        jsonResponse(res, 200, {
+          status: "logged_out",
+          profile: profilePayload("guest", null, configPath),
+          token_revoked: true
         });
         return;
       }
@@ -2151,6 +2587,36 @@ export function createRelayServer(
           return;
         }
         jsonResponse(res, 200, await configPayload(context));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/admin/scope") {
+        const context = await adminContext(req);
+        if (!context) {
+          jsonResponse(res, 401, {
+            error: { type: "unauthorized", message: "Admin bearer token required", request_id: id }
+          });
+          return;
+        }
+        jsonResponse(res, 200, {
+          profile: adminProfilePayload(context),
+          scope: await scopePayload()
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/admin/scope") {
+        const context = await adminContext(req);
+        if (!context) {
+          jsonResponse(res, 401, {
+            error: { type: "unauthorized", message: "Admin bearer token required", request_id: id }
+          });
+          return;
+        }
+        const body = await readRequestBody(req, config.server.max_body_bytes);
+        jsonResponse(res, 200, {
+          status: "applied",
+          profile: adminProfilePayload(context),
+          scope: await applyScope(context, body)
+        });
         return;
       }
       if (req.method === "GET" && url.pathname === "/admin/calls") {
@@ -2253,7 +2719,11 @@ export function createRelayServer(
         }
         const body = await readRequestBody(req, config.server.max_body_bytes);
         const nextConfig = body.config ?? body;
+        if (body.scope) validateScope(body.scope);
         const result = await saveConfig(nextConfig, context);
+        if (body.scope) {
+          result.scope = await applyScope(context, body.scope);
+        }
         jsonResponse(res, 200, result);
         return;
       }

@@ -44,20 +44,26 @@ function sessionFile() {
 
 function accountState() {
   const filePath = path.join(os.homedir(), ".codex-relay", "accounts.json");
+  let values = null;
   try {
-    const value = JSON.parse(fs.readFileSync(sessionFile(), "utf8"));
-    return { token: value.api_token, hasAccounts: true };
+    values = JSON.parse(fs.readFileSync(filePath, "utf8"));
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
   try {
-    const values = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const value = JSON.parse(fs.readFileSync(sessionFile(), "utf8"));
+    if (value.kind === "guest") return { token: null, hasAccounts: true, guestSession: true };
+    const active = Object.values(values?.accounts ?? {}).some((record) => record.api_token === value.api_token);
+    if (active) return { token: value.api_token, hasAccounts: true };
+    return { token: null, hasAccounts: true, sessionPresent: true };
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (values) {
     return {
       token: values.accounts?.[values.default_username]?.api_token,
       hasAccounts: Object.keys(values.accounts ?? {}).length > 0
     };
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
   }
   return { token: null, hasAccounts: false };
 }
@@ -68,8 +74,16 @@ try {
     process.stdout.write(account.token);
     process.exit(0);
   }
+  if (account.sessionPresent) {
+    console.error("Session token was revoked. Run: npm run cli login");
+    process.exit(1);
+  }
   const values = parseEnv(fs.readFileSync(envPath, "utf8"));
   const value = values[keyName] ?? process.env[keyName];
+  if (account.guestSession && value) {
+    process.stdout.write(value);
+    process.exit(0);
+  }
   if (!value) {
     if (account.hasAccounts) {
       console.error("No active Codex Relay account session. Run: npm run cli login or npm run cli default");

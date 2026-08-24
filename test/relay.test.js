@@ -1,14 +1,23 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { promisify } from "node:util";
 import { loadConfig, validateConfig } from "../src/config.js";
 import { AccountStore } from "../src/accounts.js";
 import { classifyUpstreamFailure } from "../src/classifier.js";
+import {
+  MobileJobManager,
+  MobileSessionProcessManager,
+  codexExecArgs,
+  createCodexAppServerRunner
+} from "../src/mobile-control.js";
 import { ensureEnvValues, loadEnvFile, parseEnv } from "../src/env.js";
 import { createRelayServer } from "../src/server.js";
 import { RuntimeState, createRuntimeState } from "../src/state.js";
@@ -132,6 +141,88 @@ function withTimeout(promise, timeoutMs) {
       }
     );
   });
+}
+
+async function waitUntil(predicate, timeoutMs = 1000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const value = await predicate();
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out after ${timeoutMs}ms`);
+}
+
+function fakeAppServerSpawn({ threadId = "thread-app", turnId = "turn-app", cwd = "" } = {}) {
+  const requests = [];
+  const approvalResponses = [];
+  const spawnFn = () => {
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.pid = 12345;
+    let buffer = "";
+    let closed = false;
+    let serverRequestId = 100;
+
+    function send(message) {
+      child.stdout.write(`${JSON.stringify(message)}\n`);
+    }
+
+    child.kill = (signal = "SIGTERM") => {
+      if (closed) {
+        return true;
+      }
+      closed = true;
+      setImmediate(() => child.emit("close", signal === "SIGTERM" ? 0 : 1, signal));
+      return true;
+    };
+
+    child.stdin.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) {
+          continue;
+        }
+        const message = JSON.parse(line);
+        requests.push(message);
+        if (message.method === "initialize") {
+          send({ id: message.id, result: { userAgent: "fake-codex", codexHome: "/tmp/codex" } });
+        } else if (message.method === "thread/start" || message.method === "thread/resume") {
+          send({ id: message.id, result: { thread: { id: threadId }, cwd } });
+          send({ method: "thread/started", params: { thread: { id: threadId } } });
+        } else if (message.method === "turn/start") {
+          send({ id: message.id, result: { turn: { id: turnId, status: "inProgress", items: [] } } });
+          send({ method: "turn/started", params: { threadId, turn: { id: turnId, status: "inProgress", items: [] } } });
+          send({
+            id: serverRequestId,
+            method: "item/commandExecution/requestApproval",
+            params: {
+              threadId,
+              turnId,
+              itemId: "item-command",
+              command: "npm test",
+              cwd,
+              startedAtMs: Date.now()
+            }
+          });
+        } else if (message.id === serverRequestId && "result" in message) {
+          approvalResponses.push(message.result);
+          send({ method: "item/agentMessage/delta", params: { threadId, turnId, itemId: "agent-message", delta: "hello " } });
+          send({ method: "item/agentMessage/delta", params: { threadId, turnId, itemId: "agent-message", delta: "mobile" } });
+          send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed", items: [] } } });
+          serverRequestId += 1;
+        }
+      }
+    });
+    return child;
+  };
+  return { spawnFn, requests, approvalResponses };
 }
 
 test("classifies quota errors as key-level failover", () => {
@@ -372,6 +463,13 @@ test("isolates local accounts, sessions, defaults, and profile credentials", asy
   const rotated = await store.rotateToken("alice");
   assert.equal(await store.authenticateToken(aliceRecord.api_token), null);
   assert.equal((await store.authenticateToken(rotated.api_token)).username, "alice");
+  await store.setSession(rotated, { RELAY_SESSION_ID: "terminal-a" });
+  await store.setDefault("alice");
+  const loggedOut = await store.logout(rotated, { RELAY_SESSION_ID: "terminal-a" });
+  assert.equal(await store.authenticateToken(rotated.api_token), null);
+  assert.equal(await store.sessionToken({ RELAY_SESSION_ID: "terminal-a" }), null);
+  assert.equal(await store.defaultToken(), null);
+  assert.equal(loggedOut.username, "alice");
   await store.delete("alice", "alice-password");
   assert.equal((await store.list()).some((item) => item.username === "alice"), false);
 });
@@ -407,6 +505,44 @@ test("relay token command falls back to guest token without an active account se
       }
     );
     assert.equal(result.stdout, "guest-relay-token");
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("relay token command does not inherit a default account after an explicit session is revoked", async () => {
+  const directory = await temporaryDirectory();
+  const envPath = path.join(directory, ".env");
+  const relayRoot = path.join(directory, ".codex-relay");
+  const sessionsPath = path.join(relayRoot, "sessions");
+  await fs.mkdir(sessionsPath, { recursive: true });
+  await fs.writeFile(envPath, "RELAY_API_KEY=guest-relay-token\n");
+  await writeJson(path.join(relayRoot, "accounts.json"), {
+    version: 1,
+    default_username: "bob",
+    accounts: {
+      alice: { username: "alice", api_token: "alice-new-token" },
+      bob: { username: "bob", api_token: "bob-token" }
+    }
+  });
+  const digest = crypto.createHash("sha256").update("terminal-a").digest("hex");
+  await writeJson(path.join(sessionsPath, `${digest}.json`), {
+    username: "alice",
+    api_token: "alice-revoked-token"
+  });
+
+  try {
+    await assert.rejects(
+      execFileAsync(
+        process.execPath,
+        ["scripts/relay-token.mjs", envPath, "RELAY_API_KEY"],
+        {
+          cwd: path.resolve("."),
+          env: { ...process.env, HOME: directory, RELAY_SESSION_ID: "terminal-a" }
+        }
+      ),
+      /Session token was revoked/
+    );
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
@@ -473,17 +609,525 @@ test("web account endpoints register, login, set default, and delete accounts", 
     assert.equal(defaulted.status, 200, defaulted.body);
     assert.equal((await accountStore.read()).default_username, "alice");
 
+    const loggedOut = await httpRequest(
+      relayPort,
+      "/admin/account/logout",
+      "POST",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(loggedOut.status, 200, loggedOut.body);
+    assert.equal((await accountStore.read()).default_username, null);
+    const oldTokenStatus = await httpRequest(
+      relayPort,
+      "/api/status",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(oldTokenStatus.status, 401, oldTokenStatus.body);
+
+    const reloggedIn = await httpRequest(
+      relayPort,
+      "/admin/account/login",
+      "POST",
+      { username: "alice", password: "alice-password" }
+    );
+    assert.equal(reloggedIn.status, 200, reloggedIn.body);
+    const currentToken = JSON.parse(reloggedIn.body).api_token;
+
     const deleted = await httpRequest(
       relayPort,
       "/admin/account/delete",
       "POST",
       { password: "alice-password" },
-      { authorization: `Bearer ${token}` }
+      { authorization: `Bearer ${currentToken}` }
     );
     assert.equal(deleted.status, 200, deleted.body);
     assert.equal((await accountStore.list()).length, 0);
     assert.equal((await accountStore.read()).default_username, null);
   } finally {
+    await close(relay);
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("web scope endpoints bind accounts or guest to global and terminal sessions", async () => {
+  const directory = await temporaryDirectory();
+  const configPath = path.join(directory, "config.json");
+  const envPath = path.join(directory, ".env");
+  const accountStore = new AccountStore({
+    filePath: path.join(directory, "accounts.json"),
+    usersPath: path.join(directory, "users"),
+    sessionsPath: path.join(directory, "sessions")
+  });
+  const config = configFor([{
+    id: "template",
+    provider: "provider-a",
+    base_url: "http://127.0.0.1:1/v1",
+    model: "upstream-model",
+    api_key: "template-key"
+  }], { admin_api_key: "guest-admin" });
+  await writeJson(configPath, config);
+  await fs.writeFile(envPath, "RELAY_API_KEY=guest-relay-token\n");
+  const relay = createRelayServer(config, new RuntimeState(), {
+    accountStore,
+    configPath,
+    envPath,
+    logger: () => {},
+    codexConfigPath: path.join(directory, "codex.toml")
+  });
+  const relayPort = await listen(relay);
+
+  try {
+    const registered = await httpRequest(
+      relayPort,
+      "/admin/account/register",
+      "POST",
+      { username: "alice", password: "alice-password" }
+    );
+    const token = JSON.parse(registered.body).api_token;
+
+    const terminalAccount = await httpRequest(
+      relayPort,
+      "/admin/scope",
+      "POST",
+      { mode: "terminal", session_id: "terminal-alice" },
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(terminalAccount.status, 200, terminalAccount.body);
+    assert.equal(await accountStore.sessionToken({ RELAY_SESSION_ID: "terminal-alice" }), token);
+    assert.equal((await accountStore.read()).default_username, null);
+    assert.equal(JSON.parse(terminalAccount.body).scope.mode, "terminal");
+
+    const currentConfig = await httpRequest(
+      relayPort,
+      "/admin/config",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    const savedWithScope = await httpRequest(
+      relayPort,
+      "/admin/config",
+      "PUT",
+      {
+        config: JSON.parse(currentConfig.body).config,
+        scope: { mode: "terminal", session_id: "terminal-alice" }
+      },
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(savedWithScope.status, 200, savedWithScope.body);
+    assert.equal(JSON.parse(savedWithScope.body).scope.mode, "terminal");
+
+    const guestTerminal = await httpRequest(
+      relayPort,
+      "/admin/scope",
+      "POST",
+      { mode: "terminal", session_id: "terminal-guest" },
+      { authorization: "Bearer guest-admin" }
+    );
+    assert.equal(guestTerminal.status, 200, guestTerminal.body);
+    const sessions = await accountStore.listSessions();
+    assert.equal(sessions.find((item) => item.session_id === "terminal-guest")?.kind, "guest");
+    assert.equal((await accountStore.read()).default_username, null);
+
+    const globalAccount = await httpRequest(
+      relayPort,
+      "/admin/scope",
+      "POST",
+      { mode: "global" },
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(globalAccount.status, 200, globalAccount.body);
+    assert.equal((await accountStore.read()).default_username, "alice");
+    assert.equal(await accountStore.defaultToken(), token);
+
+    const globalGuest = await httpRequest(
+      relayPort,
+      "/admin/scope",
+      "POST",
+      { mode: "global" },
+      { authorization: "Bearer guest-admin" }
+    );
+    assert.equal(globalGuest.status, 200, globalGuest.body);
+    assert.equal((await accountStore.read()).default_username, null);
+  } finally {
+    await close(relay);
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("mobile codex exec arguments are assembled without a shell string", () => {
+  assert.deepEqual(
+    codexExecArgs({
+      prompt: "fix the failing test",
+      cwd: "/tmp/workspace",
+      sandbox: "workspace-write",
+      model: "codex"
+    }),
+    [
+      "exec",
+      "--json",
+      "--cd",
+      "/tmp/workspace",
+      "--sandbox",
+      "workspace-write",
+      "--model",
+      "codex",
+      "fix the failing test"
+    ]
+  );
+  assert.deepEqual(
+    codexExecArgs({
+      prompt: "continue",
+      cwd: "/tmp/workspace",
+      threadId: "thread-123"
+    }),
+    ["exec", "resume", "--json", "thread-123", "continue"]
+  );
+});
+
+test("mobile workbench logs in with an account and streams codex job events", async () => {
+  const directory = await temporaryDirectory();
+  const workspace = path.join(directory, "workspace");
+  await fs.mkdir(workspace, { recursive: true });
+  const accountStore = new AccountStore({
+    filePath: path.join(directory, "accounts.json"),
+    usersPath: path.join(directory, "users"),
+    sessionsPath: path.join(directory, "sessions")
+  });
+  const config = configFor([{
+    id: "template",
+    provider: "provider-a",
+    base_url: "http://127.0.0.1:1/v1",
+    model: "upstream-model",
+    api_key: "template-key"
+  }], { admin_api_key: "guest-admin" });
+  await accountStore.register("alice", "alice-password", config);
+  const runnerJobs = [];
+  const mobileJobManager = new MobileJobManager({
+    workspaceRoots: [workspace],
+    defaultBackend: "exec",
+    runner: async ({ job, emit }) => {
+      runnerJobs.push({
+        prompt: job.prompt,
+        cwd: job.cwd,
+        thread_id: job.thread_id,
+        relay_session_id: job.relay_session_id
+      });
+      emit("codex_event", { type: "thread.started", thread_id: "thread-mobile" });
+      emit("codex_event", { type: "agent_message_delta", delta: "mobile " });
+      emit("codex_event", { type: "agent_message_delta", delta: "done" });
+      return { ok: true, exitCode: 0, signal: null };
+    }
+  });
+  const relay = createRelayServer(config, new RuntimeState(), {
+    accountStore,
+    mobileJobManager,
+    logger: () => {},
+    codexConfigPath: path.join(directory, "codex.toml")
+  });
+  const relayPort = await listen(relay);
+
+  try {
+    const unauthorized = await httpRequest(relayPort, "/mobile/api/me", "GET");
+    assert.equal(unauthorized.status, 401, unauthorized.body);
+
+    const loggedIn = await httpRequest(
+      relayPort,
+      "/mobile/login",
+      "POST",
+      { username: "alice", password: "alice-password" }
+    );
+    assert.equal(loggedIn.status, 200, loggedIn.body);
+    const token = JSON.parse(loggedIn.body).api_token;
+    assert.match(token, /^user-/);
+
+    const me = await httpRequest(
+      relayPort,
+      "/mobile/api/me",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(me.status, 200, me.body);
+    assert.deepEqual(JSON.parse(me.body).options.workspace_roots, [workspace]);
+
+    const created = await httpRequest(
+      relayPort,
+      "/mobile/api/jobs",
+      "POST",
+      { prompt: "Do one mobile task", cwd: workspace },
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(created.status, 201, created.body);
+    const jobId = JSON.parse(created.body).id;
+    assert.equal(
+      await accountStore.sessionToken({ RELAY_SESSION_ID: "mobile-alice" }),
+      token
+    );
+
+    const detail = await httpRequest(
+      relayPort,
+      `/mobile/api/jobs/${jobId}`,
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(detail.status, 200, detail.body);
+    const detailPayload = JSON.parse(detail.body);
+    assert.equal(detailPayload.thread_id, "thread-mobile");
+    assert.equal(detailPayload.final_response, "mobile done");
+
+    const continued = await httpRequest(
+      relayPort,
+      "/mobile/api/jobs",
+      "POST",
+      { prompt: "Continue mobile task", cwd: workspace, thread_id: "thread-mobile" },
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(continued.status, 201, continued.body);
+    const continuedPayload = JSON.parse(continued.body);
+    assert.equal(continuedPayload.thread_id, "thread-mobile");
+    assert.equal(runnerJobs.at(-1).thread_id, "thread-mobile");
+    assert.equal(runnerJobs.at(-1).prompt, "Continue mobile task");
+    assert.equal(runnerJobs.at(-1).relay_session_id, "mobile-alice");
+
+    const events = await httpRequest(
+      relayPort,
+      `/mobile/api/jobs/${jobId}/events`,
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(events.status, 200, events.body);
+    assert.match(events.headers["content-type"], /text\/event-stream/);
+    assert.match(events.body, /agent_message_delta/);
+    assert.match(events.body, /mobile /);
+    assert.match(events.body, /done/);
+  } finally {
+    await close(relay);
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("mobile app-server backend runs a turn and resolves command approvals", async () => {
+  const directory = await temporaryDirectory();
+  const workspace = path.join(directory, "workspace");
+  await fs.mkdir(workspace, { recursive: true });
+  const fake = fakeAppServerSpawn({ cwd: workspace });
+  const mobileJobManager = new MobileJobManager({
+    workspaceRoots: [workspace],
+    defaultBackend: "app-server",
+    appServerRunner: createCodexAppServerRunner({
+      spawnFn: fake.spawnFn,
+      requestTimeoutMs: 200
+    })
+  });
+
+  try {
+    const created = mobileJobManager.startJob("alice", {
+      prompt: "Run through app-server",
+      cwd: workspace
+    });
+    const job = mobileJobManager.getJob("alice", created.id);
+    const approval = await waitUntil(() => job.pending_approvals.values().next().value, 1000);
+    assert.equal(approval.type, "command");
+    assert.equal(approval.command, "npm test");
+
+    const resolved = mobileJobManager.resolveApproval("alice", job.id, approval.id, "accept");
+    assert.equal(resolved.pending_approvals.length, 0);
+    await waitUntil(() => job.status === "completed", 1000);
+
+    assert.equal(job.backend, "app-server");
+    assert.equal(job.thread_id, "thread-app");
+    assert.equal(job.turn_id, "turn-app");
+    assert.equal(job.final_response, "hello mobile");
+    assert.deepEqual(fake.approvalResponses, [{ decision: "accept" }]);
+    assert.deepEqual(
+      fake.requests
+        .filter((request) => request.method)
+        .map((request) => request.method),
+      ["initialize", "initialized", "thread/start", "turn/start"]
+    );
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("mobile session process resumes a Codex thread and accepts phone commands", async () => {
+  const directory = await temporaryDirectory();
+  const workspace = path.join(directory, "workspace");
+  await fs.mkdir(workspace, { recursive: true });
+  const fake = fakeAppServerSpawn({
+    threadId: "thread-app",
+    turnId: "turn-app",
+    cwd: workspace
+  });
+  const manager = new MobileSessionProcessManager({
+    workspaceRoots: [workspace],
+    spawnFn: fake.spawnFn,
+    requestTimeoutMs: 200
+  });
+  let process;
+
+  try {
+    const created = manager.startProcess("alice", {
+      thread_id: "thread-app",
+      cwd: workspace,
+      title: "Existing mobile thread"
+    });
+    process = manager.getProcess("alice", created.id);
+    assert.equal(created.status, "starting");
+
+    await waitUntil(() => process.status === "ready" && process.thread_id === "thread-app", 1000);
+    const duplicate = manager.startProcess("alice", {
+      thread_id: "thread-app",
+      cwd: workspace,
+      title: "Existing mobile thread"
+    });
+    assert.equal(duplicate.id, process.id);
+
+    await manager.sendCommand("alice", process.id, "hello from phone");
+    const approval = await waitUntil(() => process.pending_approvals.values().next().value, 1000);
+    assert.equal(approval.type, "command");
+    assert.equal(approval.command, "npm test");
+
+    manager.resolveApproval("alice", process.id, approval.id, "accept");
+    await waitUntil(() => process.status === "ready" && process.final_response === "hello mobile", 1000);
+
+    assert.equal(process.thread_id, "thread-app");
+    assert.equal(process.active_turn_id, null);
+    assert.deepEqual(fake.approvalResponses, [{ decision: "accept" }]);
+    assert.deepEqual(
+      fake.requests
+        .filter((request) => request.method)
+        .map((request) => request.method),
+      ["initialize", "initialized", "thread/resume", "turn/start"]
+    );
+  } finally {
+    if (process) {
+      manager.stopProcess("alice", process.id);
+    }
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("mobile API starts a session process from an authenticated phone request", async () => {
+  const directory = await temporaryDirectory();
+  const workspace = path.join(directory, "workspace");
+  await fs.mkdir(workspace, { recursive: true });
+  const accountStore = new AccountStore({
+    filePath: path.join(directory, "accounts.json"),
+    usersPath: path.join(directory, "users"),
+    sessionsPath: path.join(directory, "sessions")
+  });
+  const config = configFor([{
+    id: "mobile-status",
+    provider: "provider-a",
+    base_url: "http://127.0.0.1:1/v1",
+    model: "upstream-model",
+    api_key: "template-key"
+  }], { admin_api_key: "guest-admin" });
+  config.lan_control = { workspace_roots: [workspace] };
+  await accountStore.register("alice", "alice-password", config);
+  const fake = fakeAppServerSpawn({ cwd: workspace });
+  const mobileSessionProcessManager = new MobileSessionProcessManager({
+    workspaceRoots: [workspace],
+    spawnFn: fake.spawnFn
+  });
+  const relay = createRelayServer(config, new RuntimeState(), {
+    accountStore,
+    mobileSessionProcessManager,
+    logger: () => {},
+    codexConfigPath: path.join(directory, "codex.toml"),
+    codexStatePath: path.join(directory, "state.sqlite")
+  });
+  const relayPort = await listen(relay);
+  let processId;
+
+  try {
+    const loggedIn = await httpRequest(
+      relayPort,
+      "/mobile/login",
+      "POST",
+      { username: "alice", password: "alice-password" }
+    );
+    assert.equal(loggedIn.status, 200, loggedIn.body);
+    const token = JSON.parse(loggedIn.body).api_token;
+
+    const status = await httpRequest(
+      relayPort,
+      "/mobile/api/status",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(status.status, 200, status.body);
+    const statusPayload = JSON.parse(status.body);
+    assert.deepEqual(statusPayload.models, ["codex"]);
+    assert.equal(statusPayload.deployments[0].credential_configured, false);
+
+    const sessions = await httpRequest(
+      relayPort,
+      "/mobile/api/sessions",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(sessions.status, 200, sessions.body);
+    assert.deepEqual(JSON.parse(sessions.body).processes, []);
+
+    const created = await httpRequest(
+      relayPort,
+      "/mobile/api/session-processes",
+      "POST",
+      { thread_id: "thread-app", cwd: workspace, title: "Phone thread" },
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(created.status, 201, created.body);
+    processId = JSON.parse(created.body).id;
+    assert.equal(
+      await accountStore.sessionToken({ RELAY_SESSION_ID: "mobile-alice" }),
+      token
+    );
+    const process = mobileSessionProcessManager.getProcess("alice", processId);
+    await waitUntil(() => process.status === "ready", 1000);
+
+    const command = await httpRequest(
+      relayPort,
+      `/mobile/api/session-processes/${processId}/commands`,
+      "POST",
+      { prompt: "phone says continue" },
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(command.status, 200, command.body);
+    const approval = await waitUntil(() => process.pending_approvals.values().next().value, 1000);
+
+    const resolved = await httpRequest(
+      relayPort,
+      `/mobile/api/session-processes/${processId}/approvals/${approval.id}`,
+      "POST",
+      { decision: "accept" },
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(resolved.status, 200, resolved.body);
+    await waitUntil(() => process.final_response === "hello mobile", 1000);
+
+    const detail = await httpRequest(
+      relayPort,
+      `/mobile/api/session-processes/${processId}`,
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(detail.status, 200, detail.body);
+    assert.equal(JSON.parse(detail.body).final_response, "hello mobile");
+  } finally {
+    if (processId) {
+      mobileSessionProcessManager.stopProcess("alice", processId);
+    }
     await close(relay);
     await fs.rm(directory, { recursive: true, force: true });
   }
@@ -3075,6 +3719,77 @@ test("reloads config without replacing runtime state", async () => {
     await close(relay);
     await close(first);
     await close(second);
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("reload updates mobile LAN control options", async () => {
+  const directory = await temporaryDirectory();
+  const firstWorkspace = path.join(directory, "workspace-a");
+  const secondWorkspace = path.join(directory, "workspace-b");
+  await fs.mkdir(firstWorkspace, { recursive: true });
+  await fs.mkdir(secondWorkspace, { recursive: true });
+  const accountStore = new AccountStore({
+    filePath: path.join(directory, "accounts.json"),
+    usersPath: path.join(directory, "users"),
+    sessionsPath: path.join(directory, "sessions")
+  });
+  const config = configFor([{
+    id: "reload-mobile",
+    provider: "provider-a",
+    base_url: "http://127.0.0.1:1/v1",
+    model: "upstream-model",
+    api_key: "one"
+  }], { admin_api_key: "admin" });
+  config.lan_control = { workspace_roots: [firstWorkspace] };
+  const nextConfig = JSON.parse(JSON.stringify(config));
+  nextConfig.lan_control.workspace_roots = [secondWorkspace];
+  const configPath = path.join(directory, "config.json");
+  await writeJson(configPath, nextConfig);
+  await accountStore.register("alice", "alice-password", config);
+  const relay = createRelayServer(config, new RuntimeState(), {
+    configPath,
+    accountStore,
+    logger: () => {}
+  });
+  const relayPort = await listen(relay);
+
+  try {
+    const loggedIn = await httpRequest(
+      relayPort,
+      "/mobile/login",
+      "POST",
+      { username: "alice", password: "alice-password" }
+    );
+    assert.equal(loggedIn.status, 200, loggedIn.body);
+    const token = JSON.parse(loggedIn.body).api_token;
+
+    const before = await httpRequest(
+      relayPort,
+      "/mobile/api/me",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(before.status, 200, before.body);
+    assert.deepEqual(JSON.parse(before.body).options.workspace_roots, [firstWorkspace]);
+
+    const reloaded = await reloadRequest(relayPort, {
+      authorization: "Bearer admin"
+    });
+    assert.equal(reloaded.status, 200, reloaded.body);
+
+    const after = await httpRequest(
+      relayPort,
+      "/mobile/api/me",
+      "GET",
+      undefined,
+      { authorization: `Bearer ${token}` }
+    );
+    assert.equal(after.status, 200, after.body);
+    assert.deepEqual(JSON.parse(after.body).options.workspace_roots, [secondWorkspace]);
+  } finally {
+    await close(relay);
     await fs.rm(directory, { recursive: true, force: true });
   }
 });

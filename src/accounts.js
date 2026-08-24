@@ -85,6 +85,12 @@ function safePassword(password) {
   return password;
 }
 
+function safeSessionId(value) {
+  const id = String(value ?? "").trim();
+  if (!id || id.length > 256) throw new Error("Session ID must be between 1 and 256 characters");
+  return id;
+}
+
 function publicAccount(record) {
   return {
     username: record.username,
@@ -190,27 +196,78 @@ export class AccountStore {
   }
 
   async setSession(record, environment = process.env) {
+    return this.setSessionKey(record, sessionKey(environment));
+  }
+
+  sessionFilePath(sessionId) {
+    const key = safeSessionId(sessionId);
+    return path.join(this.sessionsPath, `${crypto.createHash("sha256").update(key).digest("hex")}.json`);
+  }
+
+  async setSessionKey(record, sessionId) {
+    const key = safeSessionId(sessionId);
     await fs.mkdir(this.sessionsPath, { recursive: true, mode: 0o700 });
-    const filePath = path.join(this.sessionsPath, `${crypto.createHash("sha256").update(sessionKey(environment)).digest("hex")}.json`);
-    await fs.writeFile(filePath, `${JSON.stringify({ username: record.username, api_token: record.api_token })}\n`, { mode: 0o600 });
+    const filePath = this.sessionFilePath(key);
+    await fs.writeFile(filePath, `${JSON.stringify({ session_id: key, kind: "account", username: record.username, api_token: record.api_token })}\n`, { mode: 0o600 });
+    await fs.chmod(filePath, 0o600);
+    return filePath;
+  }
+
+  async setGuestSession(sessionId) {
+    const key = safeSessionId(sessionId);
+    await fs.mkdir(this.sessionsPath, { recursive: true, mode: 0o700 });
+    const filePath = this.sessionFilePath(key);
+    await fs.writeFile(filePath, `${JSON.stringify({ session_id: key, kind: "guest" })}\n`, { mode: 0o600 });
     await fs.chmod(filePath, 0o600);
     return filePath;
   }
 
   async clearSession(environment = process.env) {
-    const filePath = path.join(this.sessionsPath, `${crypto.createHash("sha256").update(sessionKey(environment)).digest("hex")}.json`);
+    return this.clearSessionKey(sessionKey(environment));
+  }
+
+  async clearSessionKey(sessionId) {
+    const filePath = this.sessionFilePath(sessionId);
     await fs.rm(filePath, { force: true });
     return filePath;
   }
 
   async sessionToken(environment = process.env) {
-    const filePath = path.join(this.sessionsPath, `${crypto.createHash("sha256").update(sessionKey(environment)).digest("hex")}.json`);
+    const filePath = this.sessionFilePath(sessionKey(environment));
     try {
       return JSON.parse(await fs.readFile(filePath, "utf8")).api_token ?? null;
     } catch (error) {
       if (error.code === "ENOENT") return null;
       throw error;
     }
+  }
+
+  async listSessions() {
+    let entries;
+    try {
+      entries = await fs.readdir(this.sessionsPath, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    }
+    const sessions = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      try {
+        const value = JSON.parse(await fs.readFile(path.join(this.sessionsPath, entry.name), "utf8"));
+        const account = await this.authenticateToken(value.api_token);
+        sessions.push({
+          session_id: value.session_id ?? null,
+          username: account?.username ?? value.username ?? (value.kind === "guest" ? "guest" : null),
+          kind: value.kind === "guest" ? "guest" : "account",
+          active: Boolean(account),
+          updated_at: (await fs.stat(path.join(this.sessionsPath, entry.name))).mtime.toISOString()
+        });
+      } catch {
+        // Ignore a partially written or manually removed session file.
+      }
+    }
+    return sessions.filter((item) => item.session_id).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
 
   async setDefault(username) {
@@ -234,6 +291,30 @@ export class AccountStore {
   async defaultToken() {
     const data = await this.read();
     return data.accounts[data.default_username]?.api_token ?? null;
+  }
+
+  async logout(recordOrUsername, environment = process.env, {
+    clearSession = true,
+    clearDefault = true,
+    rotateToken = true
+  } = {}) {
+    const username = typeof recordOrUsername === "string"
+      ? safeUsername(recordOrUsername)
+      : safeUsername(recordOrUsername?.username);
+    const data = await this.read();
+    const record = data.accounts[username];
+    if (!record) return null;
+
+    if (clearDefault && (data.default_username === username || record.is_default)) {
+      data.default_username = null;
+      for (const account of Object.values(data.accounts)) account.is_default = false;
+    }
+    if (rotateToken) {
+      record.api_token = `user-${crypto.randomBytes(32).toString("hex")}`;
+    }
+    await this.write(data);
+    if (clearSession) await this.clearSession(environment);
+    return clone(record);
   }
 
   async delete(username, password) {

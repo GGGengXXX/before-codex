@@ -691,8 +691,9 @@ class RelayCli {
       await this.store.setDefault(this.record.username);
       this.setStatus(`${this.record.username} is now the default guest profile`, "success");
     } else if (this.cursor === 1) {
-      await this.store.clearSession(); this.record = emptyGuestRecord(this.configPath); await this.refresh(); this.screen = "home"; this.backStack = [];
-      this.setStatus("Logged out; Guest profile active", "success");
+      await this.store.logout(this.record);
+      this.record = emptyGuestRecord(this.configPath); await this.refresh(); this.screen = "home"; this.backStack = [];
+      this.setStatus("Logged out; token revoked and Guest profile active", "success");
     } else if (this.cursor === 2) this.beginDeleteForm();
     else this.back();
   }
@@ -748,7 +749,19 @@ async function main() {
   const configPath = configPathFromArgs();
   const baseConfig = await loadConfig(configPath);
   const command = ["register", "login", "logout", "default"].find((value) => process.argv.includes(value));
-  if (command === "logout") { await store.clearSession(); console.log("Logged out."); return; }
+  if (command === "logout") {
+    const sessionToken = await store.sessionToken();
+    const token = sessionToken || (sessionToken === null ? await store.defaultToken() : null);
+    const record = await store.authenticateToken(token);
+    if (record) {
+      await store.logout(record);
+      console.log(`Logged out ${record.username}; previous token revoked.`);
+    } else {
+      await store.clearSession();
+      console.log("Logged out. No active account session was found.");
+    }
+    return;
+  }
   if (command === "default") {
     const token = await store.sessionToken();
     const record = await store.authenticateToken(token);

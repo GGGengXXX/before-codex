@@ -94,6 +94,8 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     .stamp { border: 1px solid var(--black); padding: 7px 9px; font: 700 11px/1 ui-monospace, monospace; text-transform: uppercase; }
     .auth { display: grid; grid-template-columns: minmax(220px, 320px) auto; gap: 8px; align-items: end; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .scope-bar { display: grid; grid-template-columns: 150px minmax(220px, 360px) 1fr auto; gap: 10px; align-items: end; padding: 10px 12px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); }
+    .scope-status { min-height: 34px; display: flex; align-items: center; color: var(--muted); font-size: 12px; }
     .notice { min-height: 28px; padding: 8px 0; color: var(--muted); }
     .notice.good { color: var(--green); }
     .notice.bad { color: var(--red); }
@@ -508,10 +510,14 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
       .session-detail-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .detail-hero-aside { border-left: 0; border-top: 1px solid var(--line); padding: 12px 0 0; text-align: left; }
       .topbar { grid-template-columns: 1fr; }
+      .scope-bar { grid-template-columns: 1fr 1fr; }
+      .scope-status { grid-column: 1 / -1; }
     }
     @media (max-width: 620px) {
       .shell { padding: 14px; }
       .auth { grid-template-columns: 1fr; }
+      .scope-bar { grid-template-columns: 1fr; }
+      .scope-status { grid-column: auto; }
       .field-grid { grid-template-columns: 1fr; }
       .session-toolbar, .session-detail-summary { grid-template-columns: 1fr; }
       .session-stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -545,6 +551,22 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
         <button id="quick-tab" class="active">Quick</button>
         <button id="json-tab">JSON</button>
       </div>
+    </div>
+    <div class="scope-bar">
+      <div class="field">
+        <label for="scope-mode">Apply scope</label>
+        <select id="scope-mode">
+          <option value="global">Global</option>
+          <option value="terminal">Terminal</option>
+        </select>
+      </div>
+      <div class="field scope-session-field">
+        <label for="scope-session">Terminal session ID</label>
+        <input id="scope-session" list="scope-session-options" placeholder="RELAY_SESSION_ID / iTerm session ID">
+        <datalist id="scope-session-options"></datalist>
+      </div>
+      <div id="scope-status" class="scope-status">Global profile: guest</div>
+      <button id="apply-scope" class="secondary">Apply Scope</button>
     </div>
     <div id="notice" class="notice" role="status" aria-live="polite">Idle</div>
 
@@ -711,6 +733,11 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     let selectedModel = "";
     let selectedProvider = "";
     let view = "quick";
+    const scopeQuery = new URLSearchParams(location.search).get("session") || "";
+    let scopeMode = ["global", "terminal"].includes(localStorage.getItem("codexRelayScopeMode") || "")
+      ? localStorage.getItem("codexRelayScopeMode")
+      : "global";
+    let scopeSessionId = scopeQuery || localStorage.getItem("codexRelayScopeSession") || "";
     const savedWorkView = localStorage.getItem("codexRelayWorkView");
     let workView = ["overview", "logs", "sessions", "apis"].includes(savedWorkView) ? savedWorkView : "overview";
     let usageRange = "week";
@@ -790,6 +817,8 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
       localStorage.setItem("codexRelaySessionWindow", String(sessionWindow));
       localStorage.setItem("codexRelaySessionPage", String(sessionPage));
       localStorage.setItem("codexRelaySessionPageSize", String(sessionPageSize));
+      localStorage.setItem("codexRelayScopeMode", scopeMode);
+      localStorage.setItem("codexRelayScopeSession", scopeSessionId);
     }
 
     function notice(text, kind = "") {
@@ -875,7 +904,9 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
       try { body = JSON.parse(text); } catch {}
       if (!response.ok) {
         const message = body?.error?.message || body || response.statusText;
-        throw new Error(message);
+        const error = new Error(message);
+        error.status = response.status;
+        throw error;
       }
       return body;
     }
@@ -1654,6 +1685,41 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
       $("account-delete").disabled = profile.kind !== "account";
     }
 
+    function renderScope(scope = null) {
+      const global = scope?.global || {};
+      const sessions = scope?.sessions || [];
+      const options = sessions
+        .filter((item) => item.session_id)
+        .map((item) => '<option value="' + escapeHtml(item.session_id) + '">' + escapeHtml(item.username || "unassigned") + (item.active ? "" : " · revoked") + '</option>')
+        .join("");
+      $("scope-session-options").innerHTML = options;
+      $("scope-mode").value = scopeMode;
+      $("scope-session").value = scopeSessionId;
+      $("scope-session").disabled = scopeMode !== "terminal";
+      const globalLabel = global.kind === "account" ? (global.username || "account") : "guest";
+      $("scope-status").textContent = "Global profile: " + globalLabel + (scopeMode === "terminal" ? " · Terminal selected" : "");
+    }
+
+    function selectedScope() {
+      return scopeMode === "terminal"
+        ? { mode: "terminal", session_id: scopeSessionId.trim() }
+        : { mode: "global" };
+    }
+
+    async function applyScope() {
+      if (scopeMode === "terminal" && !scopeSessionId.trim()) {
+        throw new Error("Enter a terminal session ID first");
+      }
+      const payload = await api("/admin/scope", {
+        method: "POST",
+        body: JSON.stringify(selectedScope())
+      });
+      persistUiState();
+      renderScope(payload.scope);
+      notice((scopeMode === "global" ? "Global" : "Terminal") + " scope applied", "good");
+      return payload;
+    }
+
     function renderSecrets(env) {
       const keys = (env?.keys || []).filter((item) => !item.internal);
       $("secret-list").innerHTML = keys.map((item) => (
@@ -1790,6 +1856,7 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     function renderAll(payload) {
       config = payload.config;
       renderProfile(payload.profile);
+      renderScope(payload.scope);
       runtimeStatus = payload.status || { deployments: [], recent_calls: [] };
       sessionPayload = null;
       sessionItems = [];
@@ -1856,11 +1923,18 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
         body: JSON.stringify({ password })
       });
       $("account-password").value = "";
-      await useGuestProfile();
+      await useGuestProfile({ revoke: false });
       notice("Account deleted", "good");
     }
 
-    async function useGuestProfile() {
+    async function useGuestProfile({ revoke = true } = {}) {
+      if (revoke && profile.kind === "account" && userToken) {
+        try {
+          await api("/admin/account/logout", { method: "POST" });
+        } catch (error) {
+          if (error.status !== 401) throw error;
+        }
+      }
       userToken = "";
       localStorage.removeItem("codexRelayUserToken");
       adminToken = guestAdminToken || bootstrapAdminToken || "";
@@ -1894,9 +1968,11 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
 
     async function save(options = {}) {
       syncConfigFromEditor();
+      const body = { config };
+      if (options.applyScope !== false) body.scope = selectedScope();
       const payload = await api("/admin/config", {
         method: "PUT",
-        body: JSON.stringify({ config })
+        body: JSON.stringify(body)
       });
       renderAll(payload);
       let codex = null;
@@ -1926,7 +2002,7 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
 
       try {
         notice("Saving current config before test...", "");
-        await save({ quiet: true, syncProvider: false });
+        await save({ quiet: true, syncProvider: false, applyScope: false });
         notice(label + deploymentId + (hard ? " (stream/tools/terminal)..." : "..."), "");
         const result = await api("/admin/test-deployment", {
           method: "POST",
@@ -2088,6 +2164,18 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     });
     $("reload").onclick = () => runButtonAction("reload", "Reloading...", reloadFile, {
       progress: "Reloading configuration from disk..."
+    });
+    $("scope-mode").onchange = () => {
+      scopeMode = $("scope-mode").value;
+      persistUiState();
+      renderScope();
+    };
+    $("scope-session").oninput = () => {
+      scopeSessionId = $("scope-session").value;
+      persistUiState();
+    };
+    $("apply-scope").onclick = () => runButtonAction("apply-scope", "Applying...", applyScope, {
+      progress: "Applying the selected account scope..."
     });
     $("shutdown").onclick = () => shutdownRelay().catch((error) => notice(error.message, "bad"));
     $("save-secrets").onclick = () => runButtonAction("save-secrets", "Saving...", saveSecrets, {

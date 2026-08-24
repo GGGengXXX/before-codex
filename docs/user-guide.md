@@ -46,6 +46,60 @@ npm run cli
 
 网页管理台左侧的 `Account` 区也提供同等操作：注册、登录、退出到 Guest、设置默认账号和删除账号。账号数据在 `~/.codex-relay/` 下按用户隔离。当前终端的登录 session 优先于默认账号，因此不同终端可以分别登录不同用户。没有当前登录 session、也没有默认账号时，Relay 会使用 `.env` 里的 `RELAY_API_KEY` 作为 Guest；Guest 继续使用项目根目录的 `config.json` 和默认状态文件。登录用户、默认用户和 Guest 的配置、调用日志、状态统计互相隔离。
 
+### 注销与多人共用电脑
+
+点击网页端或手机端 `Logout`，或者执行：
+
+```bash
+npm run cli logout
+```
+
+注销会同时清除当前终端 session、取消该账号的免登录默认状态，并轮换账号 token。已经被 Codex 或其他客户端拿到的旧 token 会立即失效；这是为了防止下一个使用者继续使用上一个人的 API。当前账号只有一个 token，因此其他设备上同一账号的旧登录也会一并失效，需要重新登录。
+
+如果终端里残留的是已撤销的 session，Codex 的 auth command 会提示 `Session token was revoked. Run: npm run cli login`，不会自动回退到另一个默认账号。下一个使用者应执行 `npm run cli login` 登录自己的账号，或明确选择 Guest 模式。
+
+### Global / Terminal 作用域
+
+网页端顶部的 `Apply scope` 用来决定账号绑定范围：
+
+- `Global`：当前 Guest 或登录用户成为全局默认 profile；没有终端专属绑定的终端会使用它；
+- `Terminal`：输入一个终端 session ID，只让这个终端使用当前 Guest 或登录用户。
+
+终端 session ID 通常来自 `RELAY_SESSION_ID`、`ITERM_SESSION_ID`、`TERM_SESSION_ID` 或 `WT_SESSION`。可以在终端执行：
+
+```bash
+echo "${RELAY_SESSION_ID:-${ITERM_SESSION_ID:-${TERM_SESSION_ID:-${WT_SESSION:-default}}}}"
+```
+
+网页端选择 `Terminal` 后填写这个值，再点击 `Apply Scope`；之后点击 `Save + Reload` 也会携带当前作用域。Terminal scope 只改变“这个终端使用哪个账号”，API 配置仍然保存在账号自己的 profile 中。
+
+## 手机局域网工作台
+
+手机和电脑在同一个局域网时，可以访问：
+
+```text
+http://电脑局域网IP:8787/mobile
+```
+
+手机端使用已有账号的用户名和密码登录。账号注册仍建议在电脑本机网页管理台或 CLI 完成；手机工作台提供登录、查看 API 状态、搜索电脑上的 Codex sessions、启动后台 session 进程、发送命令、查看事件流、处理 app-server 审批和打断任务。
+
+如果手机打不开页面，先确认 `config.json` 里监听地址不是默认的 `127.0.0.1`，而是：
+
+```json
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8787
+  }
+}
+```
+
+改完监听地址需要重启 Relay。移动端默认只能在 `lan_control.workspace_roots` 指定的目录下运行。
+
+手机页的 `API State` 会显示当前账号配置下的 API 健康状态和 deployment 摘要，但不会返回真实 API Key。`Sessions` 会读取电脑上的 Codex thread 记录；点选一条 session 后，Relay 会在电脑上启动一个长驻 `codex app-server --stdio` 后台进程，并通过 `thread/resume` 进入这条 session。之后进入 `Live` 页，在手机上输入命令，电脑上的后台进程会执行并把 app-server 事件流返回给手机。
+
+`Quick` 页保留一次性任务，默认执行后端是 `codex app-server --stdio`，页面里的 `Backend` 也可以切回 `exec` fallback。默认同一用户同时只允许 1 个一次性 Codex run。默认 `app_server_approval_policy` 是 `never`，手机端会少看到审批提示；如果改成 `on-request`，app-server 发出的命令或文件变更审批会出现在手机详情区。
+
 ## 快速开始
 
 ### 1. 准备配置文件
