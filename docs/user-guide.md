@@ -206,6 +206,16 @@ args = ["/absolute/path/to/scripts/relay-token.mjs", "/absolute/path/to/.env", "
 
 左侧的 `Routes` 是“Codex 模型名映射”。比如 Codex 请求 `codex`，Relay 会先找到这个 route，再从该 route 下面的 API 列表里选择真实上游 `base_url + API key + model`。平时新增上游接口用 `APIs` 里的 `Add API`；只有想新增一个 Codex 可选择的模型名时，才使用 `Add Route`。
 
+默认情况下，Relay 会清洗不规范的 Responses item，避免第三方 Provider 的私有 reasoning state 污染后续跨 Provider failover。若你能保证同一个会话固定使用同一个 Provider，可以在 API 卡片的 `provider state` 里勾选 `Preserve state`，或在该 deployment 的 `compatibility` 里开启完全透传：
+
+```json
+{
+  "passthrough_provider_state": true
+}
+```
+
+开启后，请求、响应和 SSE 里的 Responses item 会原样保留；这适合 DeepSeek thinking 或固定 Modelgate 这类需要回传 provider state 的场景，不建议和混合 Provider 备用切换一起使用。
+
 ## 怎么验证是否可用
 
 先看状态页：

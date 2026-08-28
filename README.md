@@ -318,13 +318,26 @@ Relay 默认开启兼容过滤：
       "drop_invalid_reasoning_items": true,
       "strip_invalid_request_item_ids": true,
       "strip_invalid_response_item_ids": true,
-      "convert_dsml_tool_calls": true
+      "convert_dsml_tool_calls": true,
+      "passthrough_provider_state": false
     }
   }
 }
 ```
 
 它会在请求侧移除旧历史里的非法 reasoning item，并去掉 message/tool item 上错误的第三方 `id`；也会在响应侧阻止新的非法 reasoning item 和错误 item id 写入 Codex 历史。不要把 `item_*` 伪造成 `rs_*` 或 `msg_*`；这些 ID 可能代表上游私有状态，改前缀并不能让官方 OpenAI 认识它。
+
+如果某个 deployment 会固定服务同一个会话，并且你愿意信任该 Provider 的私有 state，可以在 API 卡片的 `provider state` 里勾选 `Preserve state`，或在该 deployment 上开启完全透传：
+
+```json
+{
+  "compatibility": {
+    "passthrough_provider_state": true
+  }
+}
+```
+
+开启后 Relay 不会清洗请求/响应/SSE 里的 Responses item，也不会把 DSML tool call 转成标准 `function_call`。这适合 DeepSeek thinking、固定 Modelgate 等需要回传 provider state 的场景；不建议和跨 Provider failover 混用。
 
 ## 安全建议
 

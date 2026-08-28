@@ -25,7 +25,8 @@ import {
   extractOutputTextFromSse,
   extractOutputTextPartsFromSse,
   sseHasDoneMarker,
-  sseHasTerminalEvent
+  sseHasTerminalEvent,
+  synthesizeResponseSseFromJson
 } from "../src/upstream.js";
 
 const execFileAsync = promisify(execFile);
@@ -82,6 +83,35 @@ function request(port, body, headers = {}) {
 function reloadRequest(port, headers = {}) {
   return httpRequest(port, "/admin/reload", "POST", undefined, headers);
 }
+
+test("serves the branded favicon to every web entry point", async () => {
+  const relay = createRelayServer(configFor([{
+    id: "favicon-test",
+    provider: "test",
+    base_url: "http://127.0.0.1:1/v1",
+    model: "test-model",
+    api_key: "test-key"
+  }]), new RuntimeState(), { logger: () => {} });
+  const relayPort = await listen(relay);
+  try {
+    const icon = await httpRequest(relayPort, "/favicon.svg", "GET");
+    assert.equal(icon.status, 200);
+    assert.match(icon.headers["content-type"], /image\/svg\+xml/);
+    assert.match(icon.body, /aria-label="Codex Relay"/);
+
+    for (const entryPoint of ["/", "/admin", "/mobile"]) {
+      const page = await httpRequest(relayPort, entryPoint, "GET");
+      assert.equal(page.status, 200);
+      assert.match(page.body, /<link rel="icon" href="\/favicon\.svg" type="image\/svg\+xml">/);
+    }
+    const admin = await httpRequest(relayPort, "/admin", "GET");
+    assert.match(admin.body, /provider state/);
+    assert.match(admin.body, /Preserve state/);
+    assert.match(admin.body, /setDeploymentCompatibility/);
+  } finally {
+    await close(relay);
+  }
+});
 
 function configFor(upstreams, options = {}) {
   return validateConfig({
@@ -289,6 +319,50 @@ test("extracts complete message items separately from response text deltas", () 
       completedText: "complete message"
     }
   );
+});
+
+test("synthesizes Responses SSE from non-stream JSON with custom tool calls", () => {
+  const streamText = synthesizeResponseSseFromJson({
+    requestId: "test-request",
+    response: {
+      id: "resp-non-stream-json",
+      object: "response",
+      status: "completed",
+      output: [
+        { type: "reasoning", id: "rs_non_stream_json", summary: [] },
+        {
+          type: "message",
+          id: "msg_non_stream_json",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "bridge ok" }]
+        },
+        {
+          type: "custom_tool_call",
+          id: "ctc_non_stream_json",
+          call_id: "call_non_stream_json",
+          name: "exec",
+          input: "{\"cmd\":\"pwd\"}",
+          status: "completed"
+        }
+      ],
+      usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 }
+    }
+  });
+  const parts = extractOutputTextPartsFromSse(streamText);
+
+  assert.match(streamText, /response\.created/);
+  assert.match(streamText, /response\.output_item\.added/);
+  assert.match(streamText, /response\.output_text\.delta/);
+  assert.match(streamText, /response\.output_text\.done/);
+  assert.match(streamText, /response\.custom_tool_call_input\.delta/);
+  assert.match(streamText, /response\.custom_tool_call_input\.done/);
+  assert.match(streamText, /response\.output_item\.done/);
+  assert.match(streamText, /response\.completed/);
+  assert.equal(sseHasTerminalEvent(streamText), true);
+  assert.equal(sseHasDoneMarker(streamText), true);
+  assert.equal(parts.deltaText, "bridge ok");
+  assert.equal(streamText.includes("\"type\":\"custom_tool_call\""), true);
 });
 
 test("parses dotenv-style environment files", () => {
@@ -1622,6 +1696,63 @@ test("sanitizes invalid reasoning items before replaying request history", async
   }
 });
 
+test("passes provider state through without request item sanitization when enabled", async () => {
+  let upstreamBody = null;
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "resp-passthrough-request", output_text: "OK" }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const config = configFor([
+    {
+      id: "passthrough-request",
+      provider: "deepseek",
+      base_url: `http://127.0.0.1:${upstreamPort}/v1`,
+      model: "deepseek-model",
+      api_key: "key",
+      compatibility: {
+        passthrough_provider_state: true
+      }
+    }
+  ], { max_attempts: 1 });
+  const relay = createRelayServer(config, new RuntimeState(), { logger: () => {} });
+  const relayPort = await listen(relay);
+
+  try {
+    const result = await request(relayPort, {
+      model: "gpt-test",
+      input: [
+        {
+          type: "message",
+          id: "item_bad_message",
+          role: "user",
+          content: [{ type: "input_text", text: "hello" }]
+        },
+        {
+          type: "reasoning",
+          id: "item_deepseek_reasoning",
+          content: [{ type: "reasoning_text", text: "provider state" }]
+        }
+      ],
+      stream: false
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(upstreamBody.model, "deepseek-model");
+    assert.equal(upstreamBody.input[0].id, "item_bad_message");
+    assert.equal(upstreamBody.input[1].id, "item_deepseek_reasoning");
+    assert.deepEqual(upstreamBody.input[1].content, [{ type: "reasoning_text", text: "provider state" }]);
+  } finally {
+    await close(relay);
+    await close(upstream);
+  }
+});
+
 test("strips previous_response_id only when deployment compatibility requests it", async () => {
   const upstreamBodies = [];
   const upstream = http.createServer((req, res) => {
@@ -1739,6 +1870,64 @@ test("sanitizes invalid reasoning items from non-stream Responses payloads", asy
     assert.equal(payload.output.length, 1);
     assert.equal(payload.output[0].id, "msg_ok");
     assert.equal(result.body.includes("item_bad_reasoning"), false);
+  } finally {
+    await close(relay);
+    await close(upstream);
+  }
+});
+
+test("passes provider state through in non-stream responses when enabled", async () => {
+  const upstreamBody = JSON.stringify({
+    id: "resp-passthrough-response",
+    output: [
+      {
+        type: "reasoning",
+        id: "item_deepseek_reasoning",
+        content: [{ type: "reasoning_text", text: "keep me" }]
+      },
+      {
+        type: "message",
+        id: "item_bad_message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "OK" }]
+      }
+    ]
+  }, null, 2);
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(upstreamBody);
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const config = configFor([
+    {
+      id: "passthrough-response",
+      provider: "deepseek",
+      base_url: `http://127.0.0.1:${upstreamPort}/v1`,
+      model: "deepseek-model",
+      api_key: "key",
+      compatibility: {
+        passthrough_provider_state: true
+      }
+    }
+  ], { max_attempts: 1 });
+  const relay = createRelayServer(config, new RuntimeState(), { logger: () => {} });
+  const relayPort = await listen(relay);
+
+  try {
+    const result = await request(relayPort, {
+      model: "gpt-test",
+      input: "hello",
+      stream: false
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.body, upstreamBody);
+    assert.equal(result.body.includes("item_deepseek_reasoning"), true);
+    assert.equal(result.body.includes("reasoning_text"), true);
+    assert.equal(result.body.includes("item_bad_message"), true);
   } finally {
     await close(relay);
     await close(upstream);
@@ -1873,6 +2062,51 @@ test("sanitizes invalid reasoning items from Responses SSE events", async () => 
     assert.equal(result.body.includes("response.completed"), true);
     const status = JSON.parse((await httpRequest(relayPort, "/api/status", "GET")).body);
     assert.equal(status.deployments[0].token_usage.total_tokens, 2);
+  } finally {
+    await close(relay);
+    await close(upstream);
+  }
+});
+
+test("passes provider state through in Responses SSE events when enabled", async () => {
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"reasoning","id":"item_deepseek_reasoning","content":[{"type":"reasoning_text","text":"keep me"}]}}\n\n');
+      res.write('event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","item_id":"item_deepseek_reasoning","delta":"keep me"}\n\n');
+      res.write('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp-sse-passthrough","output":[{"type":"reasoning","id":"item_deepseek_reasoning","content":[{"type":"reasoning_text","text":"keep me"}]},{"type":"message","id":"item_bad_message","role":"assistant","content":[]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n');
+      res.end();
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const config = configFor([
+    {
+      id: "passthrough-sse",
+      provider: "deepseek",
+      base_url: `http://127.0.0.1:${upstreamPort}/v1`,
+      model: "deepseek-model",
+      api_key: "key",
+      compatibility: {
+        passthrough_provider_state: true
+      }
+    }
+  ], { max_attempts: 1 });
+  const relay = createRelayServer(config, new RuntimeState(), { logger: () => {} });
+  const relayPort = await listen(relay);
+
+  try {
+    const result = await request(relayPort, {
+      model: "gpt-test",
+      input: "hello",
+      stream: true
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(result.body.includes("item_deepseek_reasoning"), true);
+    assert.equal(result.body.includes("reasoning_text"), true);
+    assert.equal(result.body.includes("response.reasoning_text.delta"), true);
+    assert.equal(result.body.includes("item_bad_message"), true);
   } finally {
     await close(relay);
     await close(upstream);
@@ -3188,6 +3422,143 @@ test("synthesizes response.completed when upstream ends with only DONE", async (
     assert.match(result.body, /response\.completed/);
     assert.equal(recent.result, "success");
     assert.equal(recent.response_text, "hello");
+  } finally {
+    await close(relay);
+    await close(upstream);
+  }
+});
+
+test("bridges streaming clients through non-stream upstream compatibility", async () => {
+  let upstreamBody = null;
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "resp-non-stream-bridge",
+        object: "response",
+        status: "completed",
+        output: [
+          { type: "reasoning", id: "rs_non_stream_bridge", summary: [] },
+          {
+            type: "message",
+            id: "msg_non_stream_bridge",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "bridge ok" }]
+          },
+          {
+            type: "custom_tool_call",
+            id: "ctc_non_stream_bridge",
+            call_id: "call_non_stream_bridge",
+            name: "exec",
+            input: "{\"cmd\":\"pwd\"}",
+            status: "completed"
+          }
+        ],
+        usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 }
+      }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const config = configFor([
+    {
+      id: "non-stream-bridge",
+      provider: "provider-a",
+      base_url: `http://127.0.0.1:${upstreamPort}/v1`,
+      model: "upstream-model",
+      api_key: "one",
+      compatibility: { stream_via_non_stream: true }
+    }
+  ]);
+  const state = new RuntimeState();
+  const relay = createRelayServer(config, state, { logger: () => {} });
+  const relayPort = await listen(relay);
+
+  try {
+    const result = await request(relayPort, {
+      model: "gpt-test",
+      input: "hello",
+      stream: true
+    });
+    const recent = state.recentCalls(1)[0];
+    const parts = extractOutputTextPartsFromSse(result.body);
+
+    assert.equal(result.status, 200);
+    assert.match(result.headers["content-type"], /text\/event-stream/);
+    assert.equal(upstreamBody.stream, false);
+    assert.match(result.body, /response\.created/);
+    assert.match(result.body, /response\.output_item\.added/);
+    assert.match(result.body, /response\.output_text\.delta/);
+    assert.match(result.body, /response\.output_text\.done/);
+    assert.match(result.body, /response\.custom_tool_call_input\.delta/);
+    assert.match(result.body, /response\.custom_tool_call_input\.done/);
+    assert.match(result.body, /response\.output_item\.done/);
+    assert.match(result.body, /response\.completed/);
+    assert.match(result.body, /data: \[DONE\]/);
+    assert.match(result.body, /bridge ok/);
+    assert.match(result.body, /"type":"custom_tool_call"/);
+    assert.equal(parts.deltaText, "bridge ok");
+    assert.equal(recent.result, "success");
+    assert.equal(recent.response_text, "bridge ok");
+    assert.equal(recent.usage.total_tokens, 3);
+  } finally {
+    await close(relay);
+    await close(upstream);
+  }
+});
+
+test("passes through JSON-stringified SSE from non-stream bridge upstreams", async () => {
+  let upstreamBody = null;
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const sseText = [
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp-stringified-sse","status":"in_progress"}}',
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"wrapped ok"}',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp-stringified-sse","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"wrapped ok"}]}],"usage":{"input_tokens":4,"output_tokens":5,"total_tokens":9}}}'
+      ].join("\n\n") + "\n\n";
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(JSON.stringify(sseText));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const config = configFor([
+    {
+      id: "stringified-sse-bridge",
+      provider: "provider-a",
+      base_url: `http://127.0.0.1:${upstreamPort}/v1`,
+      model: "upstream-model",
+      api_key: "one",
+      compatibility: { stream_via_non_stream: true }
+    }
+  ]);
+  const state = new RuntimeState();
+  const relay = createRelayServer(config, state, { logger: () => {} });
+  const relayPort = await listen(relay);
+
+  try {
+    const result = await request(relayPort, {
+      model: "gpt-test",
+      input: "hello",
+      stream: true
+    });
+    const recent = state.recentCalls(1)[0];
+    const parts = extractOutputTextPartsFromSse(result.body);
+
+    assert.equal(result.status, 200);
+    assert.match(result.headers["content-type"], /text\/event-stream/);
+    assert.equal(upstreamBody.stream, false);
+    assert.match(result.body, /^event: response\.created/m);
+    assert.match(result.body, /response\.completed/);
+    assert.equal(parts.deltaText, "wrapped ok");
+    assert.equal(recent.result, "success");
+    assert.equal(recent.response_text, "wrapped ok");
+    assert.equal(recent.usage.total_tokens, 9);
   } finally {
     await close(relay);
     await close(upstream);

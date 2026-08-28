@@ -4,6 +4,8 @@ export function renderMobilePage() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#173f35">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <title>Codex LAN Desk</title>
   <style>
     :root {

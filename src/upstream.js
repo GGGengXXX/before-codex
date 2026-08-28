@@ -58,6 +58,10 @@ function compatibilityEnabled(compatibility, key) {
   return compatibility?.[key] !== false;
 }
 
+function providerStatePassthroughEnabled(compatibility) {
+  return compatibility?.passthrough_provider_state === true;
+}
+
 function decodeXmlText(value) {
   return String(value)
     .replace(/&lt;/g, "<")
@@ -276,6 +280,9 @@ function sanitizeResponsesValue(value, compatibility, { stripRequestIds = false 
 }
 
 export function sanitizeRequestBody(body, compatibility = {}) {
+  if (providerStatePassthroughEnabled(compatibility)) {
+    return body;
+  }
   if (!compatibilityEnabled(compatibility, "sanitize_request_items")) {
     return body;
   }
@@ -289,6 +296,9 @@ export function sanitizeRequestBody(body, compatibility = {}) {
 }
 
 export function sanitizeResponsePayload(value, compatibility = {}, requestId = "relay", requestBody = null) {
+  if (providerStatePassthroughEnabled(compatibility)) {
+    return value;
+  }
   if (!compatibilityEnabled(compatibility, "sanitize_response_items")) {
     return value;
   }
@@ -312,6 +322,9 @@ function splitSseEvent(buffer) {
 }
 
 function sanitizeSseEvent(event, compatibility, requestId = "relay", requestBody = null) {
+  if (providerStatePassthroughEnabled(compatibility)) {
+    return event;
+  }
   if (!compatibilityEnabled(compatibility, "sanitize_response_items")) {
     return event;
   }
@@ -381,6 +394,17 @@ function dsmlToolCallSse({ calls, visibleText, responseId, requestId, usage, req
 }
 
 export function createSseSanitizer(compatibility = {}, requestId = "relay", requestBody = null) {
+  if (providerStatePassthroughEnabled(compatibility)) {
+    return {
+      push(chunk) {
+        return chunk;
+      },
+      flush() {
+        return "";
+      }
+    };
+  }
+
   let buffer = "";
   let pending = [];
   let pendingText = "";
@@ -721,26 +745,229 @@ export function sseHasDoneMarker(text) {
   return /(?:^|\r?\n)data:\s*\[DONE\]\s*(?:\r?\n|$)/m.test(text);
 }
 
-export function synthesizeResponseCompletedSse({ responseId, requestId, outputText, usage } = {}) {
-  const fallbackId = `resp_${String(requestId ?? "relay").replace(/[^A-Za-z0-9]/g, "")}`;
-  const response = {
-    id: responseId || fallbackId,
-    object: "response",
-    created_at: Math.floor(Date.now() / 1000),
-    status: "completed",
-    output: outputText
-      ? [{
-          type: "message",
-          role: "assistant",
-          content: [{ type: "output_text", text: outputText }]
-        }]
-      : [],
-    usage: usage ?? null
-  };
-  return `event: response.completed\ndata: ${JSON.stringify({
+function fallbackResponseId(requestId) {
+  return `resp_${String(requestId ?? "relay").replace(/[^A-Za-z0-9]/g, "")}`;
+}
+
+function outputFromText(outputText) {
+  return outputText
+    ? [{
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: outputText }]
+      }]
+    : [];
+}
+
+function completedResponsePayload({ response, responseId, requestId, outputText, usage } = {}) {
+  const completedResponse = response && typeof response === "object"
+    ? { ...response }
+    : {};
+  completedResponse.id ||= responseId || fallbackResponseId(requestId);
+  completedResponse.object ||= "response";
+  completedResponse.created_at ||= Math.floor(Date.now() / 1000);
+  completedResponse.status = "completed";
+  if (!Array.isArray(completedResponse.output) || (completedResponse.output.length === 0 && outputText)) {
+    completedResponse.output = outputFromText(outputText);
+  }
+  if (completedResponse.usage === undefined) {
+    completedResponse.usage = usage ?? null;
+  }
+  return completedResponse;
+}
+
+function sseEvent(type, payload) {
+  return `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+}
+
+function fallbackItemId(type, requestId, index) {
+  const suffix = String(requestId || "relay").replace(/[^A-Za-z0-9]/g, "").slice(-24) || "relay";
+  const prefix = {
+    message: "msg",
+    function_call: "fc",
+    custom_tool_call: "ctc",
+    reasoning: "rs"
+  }[type] || "item";
+  return `${prefix}_${suffix}_${index + 1}`;
+}
+
+function fallbackCallId(requestId, index) {
+  const suffix = String(requestId || "relay").replace(/[^A-Za-z0-9]/g, "").slice(-24) || "relay";
+  return `call_${suffix}_${index + 1}`;
+}
+
+function stringValue(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === undefined || value === null) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function normalizeOutputItem(item, requestId, index) {
+  if (!item || typeof item !== "object") {
+    return {
+      type: "message",
+      id: fallbackItemId("message", requestId, index),
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: String(item ?? "") }]
+    };
+  }
+
+  const normalized = { ...item };
+  const type = typeof normalized.type === "string" ? normalized.type : "message";
+  normalized.type = type;
+  normalized.id ||= fallbackItemId(type, requestId, index);
+
+  if (type === "message") {
+    normalized.role ||= "assistant";
+    normalized.status ||= "completed";
+    normalized.content = Array.isArray(normalized.content)
+      ? normalized.content.map((part) => (part && typeof part === "object" ? { ...part } : part))
+      : [];
+  } else if (type === "function_call") {
+    normalized.call_id ||= fallbackCallId(requestId, index);
+    normalized.arguments = stringValue(normalized.arguments);
+    normalized.status ||= "completed";
+  } else if (type === "custom_tool_call") {
+    normalized.call_id ||= fallbackCallId(requestId, index);
+    normalized.input = stringValue(normalized.input ?? normalized.arguments);
+    delete normalized.arguments;
+    normalized.status ||= "completed";
+  }
+
+  return normalized;
+}
+
+function outputItemForAddedEvent(item) {
+  const added = { ...item };
+  if (item.type === "message") {
+    added.status = "in_progress";
+    added.content = [];
+  } else if (item.type === "function_call") {
+    added.status = "in_progress";
+    added.arguments = "";
+  } else if (item.type === "custom_tool_call") {
+    added.status = "in_progress";
+    added.input = "";
+  }
+  return added;
+}
+
+function outputTextParts(item) {
+  if (!Array.isArray(item.content)) {
+    return [];
+  }
+  return item.content
+    .map((part, contentIndex) => ({ part, contentIndex }))
+    .filter(({ part }) => part?.type === "output_text" && typeof part.text === "string");
+}
+
+export function synthesizeResponseCompletedSse({ response, responseId, requestId, outputText, usage } = {}) {
+  const completedResponse = completedResponsePayload({ response, responseId, requestId, outputText, usage });
+  return sseEvent("response.completed", {
     type: "response.completed",
-    response
-  })}\n\n`;
+    response: completedResponse
+  });
+}
+
+export function synthesizeResponseSseFromJson({ response, responseId, requestId, outputText, usage } = {}) {
+  const completedResponse = completedResponsePayload({ response, responseId, requestId, outputText, usage });
+  const output = completedResponse.output.map((item, index) => normalizeOutputItem(item, requestId, index));
+  completedResponse.output = output;
+
+  const events = [];
+  let sequenceNumber = 0;
+  const pushEvent = (type, payload) => {
+    sequenceNumber += 1;
+    events.push(sseEvent(type, {
+      ...payload,
+      sequence_number: sequenceNumber
+    }));
+  };
+
+  pushEvent("response.created", {
+    type: "response.created",
+    response: {
+      ...completedResponse,
+      status: "in_progress",
+      output: []
+    }
+  });
+
+  output.forEach((item, outputIndex) => {
+    pushEvent("response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item: outputItemForAddedEvent(item)
+    });
+
+    if (item.type === "message") {
+      for (const { part, contentIndex } of outputTextParts(item)) {
+        pushEvent("response.output_text.delta", {
+          type: "response.output_text.delta",
+          item_id: item.id,
+          output_index: outputIndex,
+          content_index: contentIndex,
+          delta: part.text
+        });
+        pushEvent("response.output_text.done", {
+          type: "response.output_text.done",
+          item_id: item.id,
+          output_index: outputIndex,
+          content_index: contentIndex,
+          text: part.text
+        });
+      }
+    } else if (item.type === "function_call") {
+      pushEvent("response.function_call_arguments.delta", {
+        type: "response.function_call_arguments.delta",
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: item.arguments
+      });
+      pushEvent("response.function_call_arguments.done", {
+        type: "response.function_call_arguments.done",
+        item_id: item.id,
+        output_index: outputIndex,
+        name: item.name,
+        arguments: item.arguments
+      });
+    } else if (item.type === "custom_tool_call") {
+      pushEvent("response.custom_tool_call_input.delta", {
+        type: "response.custom_tool_call_input.delta",
+        item_id: item.id,
+        output_index: outputIndex,
+        delta: item.input
+      });
+      pushEvent("response.custom_tool_call_input.done", {
+        type: "response.custom_tool_call_input.done",
+        item_id: item.id,
+        output_index: outputIndex,
+        input: item.input
+      });
+    }
+
+    pushEvent("response.output_item.done", {
+      type: "response.output_item.done",
+      output_index: outputIndex,
+      item
+    });
+  });
+
+  pushEvent("response.completed", {
+    type: "response.completed",
+    response: completedResponse
+  });
+  events.push("data: [DONE]\n\n");
+  return events.join("");
 }
 
 export function synthesizeResponseFailedSse({ responseId, requestId, message, code = "upstream_stream_interrupted" } = {}) {

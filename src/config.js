@@ -211,7 +211,8 @@ export function validateConfig(config) {
       drop_invalid_reasoning_items: true,
       strip_invalid_request_item_ids: true,
       strip_invalid_response_item_ids: true,
-      convert_dsml_tool_calls: true
+      convert_dsml_tool_calls: true,
+      passthrough_provider_state: false
     }
   );
   config.routing.cooldowns ??= {};

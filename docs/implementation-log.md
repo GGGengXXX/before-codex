@@ -775,7 +775,8 @@ Invalid 'input[324].id': 'item_...'. Expected an ID that begins with 'rs'.
       "sanitize_response_items": true,
       "drop_invalid_reasoning_items": true,
       "strip_invalid_request_item_ids": true,
-      "strip_invalid_response_item_ids": true
+      "strip_invalid_response_item_ids": true,
+      "passthrough_provider_state": false
     }
   }
 }
@@ -1430,7 +1431,44 @@ The `reasoning_text` in the thinking mode must be passed back to the API.
 - 显式配置 `strip_previous_response_id: true` 的 deployment 会删除 `previous_response_id`；
 - 未配置的普通 provider 不受影响，仍保留 `previous_response_id`。
 
-## 18. `X-OpenAI-Internal-Codex-Responses-Lite` 与 provider/model 混用（2026-08-23）
+## 18. Provider state 完全透传开关（2026-08-28）
+
+### 背景
+
+默认清洗策略保护的是“跨 Provider failover”：当上游 A 返回私有 reasoning item、错误 item id 或加密 state 时，后续切到上游 B 不会因为不认识这些 state 而拒绝请求。
+
+但如果用户明确保证同一个会话固定使用同一个 Provider，这类清洗会损失模型连续性。DeepSeek thinking + tools 还会要求把历史 `reasoning_text` 回传；固定 Modelgate 场景也可能依赖自己的 provider state。
+
+### 实现
+
+新增 deployment 级开关：
+
+```json
+{
+  "compatibility": {
+    "passthrough_provider_state": true
+  }
+}
+```
+
+开启后：
+
+- 请求侧不清洗 `input` 中的 Responses item；
+- 非流式响应直接返回上游原始 body，不再 parse/stringify；
+- SSE 不进入逐事件清洗和 DSML tool call 转换；
+- Relay 仍保留模型改写、认证、路由、日志、超时和必要的异常流终止事件。
+
+该模式适合固定 Provider/固定 deployment 的会话，不建议和混合 Provider fallback 一起使用。
+
+### 验证
+
+新增回归测试：
+
+- 开启透传后，请求里的非法 message id、DeepSeek reasoning item 和 `reasoning_text` 会保留；
+- 开启透传后，非流式响应 body 字节内容按上游返回值直接返回；
+- 开启透传后，SSE 中的 reasoning event 和非标准 item id 不会被丢弃。
+
+## 19. `X-OpenAI-Internal-Codex-Responses-Lite` 与 provider/model 混用（2026-08-23）
 
 ### 现象
 

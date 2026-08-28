@@ -4,6 +4,8 @@ export function renderStatusPage() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#173f35">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <title>Codex Relay</title>
   <style>
     :root {

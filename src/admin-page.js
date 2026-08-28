@@ -5,6 +5,8 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#173f35">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <title>Codex Relay Admin</title>
   <style>
     :root {
@@ -79,6 +81,22 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     input[type="range"] { padding: 0; accent-color: var(--green); }
     input[type="checkbox"] { width: auto; min-height: 0; }
     textarea { min-height: 420px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; resize: vertical; }
+    label.checkbox-row {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--field);
+      color: var(--ink);
+      padding: 7px 9px;
+      margin-bottom: 0;
+      font-size: 13px;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .checkbox-row input { margin: 0; accent-color: var(--green); }
     .shell { max-width: 1380px; margin: 0 auto; padding: 24px; }
     .topbar {
       display: grid;
@@ -1755,6 +1773,22 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
       }
     }
 
+    function setDeploymentCompatibility(index, field, value, rerender = false) {
+      const deployment = currentModelConfig().deployments[index];
+      if (!deployment) return;
+      const current = deployment.compatibility && typeof deployment.compatibility === "object" && !Array.isArray(deployment.compatibility)
+        ? deployment.compatibility
+        : {};
+      deployment.compatibility = { ...current, [field]: value };
+      syncEditorFromConfig();
+      if (rerender) {
+        renderApis();
+      }
+      if (field === "passthrough_provider_state") {
+        notice((value ? "Provider state passthrough enabled for " : "Provider state passthrough disabled for ") + deployment.id + " · save to apply", "good");
+      }
+    }
+
     function onlyDeployment(index) {
       const deployments = currentModelConfig().deployments;
       const selected = deployments[index];
@@ -1817,6 +1851,10 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
       '</div>';
     }
 
+    function checkboxRow(checked, onchange, label) {
+      return '<label class="checkbox-row"><input type="checkbox" ' + (checked ? "checked" : "") + ' onchange="' + onchange + '"><span>' + escapeHtml(label) + '</span></label>';
+    }
+
     function renderApis() {
       const list = $("api-list");
       const deployments = currentModelConfig().deployments;
@@ -1827,9 +1865,10 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
         const usage = live.token_usage || {};
         const last = live.last_request;
         const credential = live.credential_configured ?? !missingApiKey(item.api_key);
+        const passthroughProviderState = item.compatibility?.passthrough_provider_state === true;
         return '<article class="api-row ' + (enabled ? "" : "disabled") + '">' +
           '<div class="api-head">' +
-            '<div class="api-name"><strong>' + escapeHtml(item.id) + '</strong><span class="pill ' + (enabled ? "on" : "") + '">' + (enabled ? "enabled" : "disabled") + '</span><span class="pill">' + escapeHtml(live.status || "new") + '</span><span class="pill ' + (credential ? "on" : "") + '">' + (credential ? "key set" : "missing key") + '</span></div>' +
+            '<div class="api-name"><strong>' + escapeHtml(item.id) + '</strong><span class="pill ' + (enabled ? "on" : "") + '">' + (enabled ? "enabled" : "disabled") + '</span><span class="pill">' + escapeHtml(live.status || "new") + '</span><span class="pill ' + (credential ? "on" : "") + '">' + (credential ? "key set" : "missing key") + '</span><span class="pill ' + (passthroughProviderState ? "on" : "") + '">' + (passthroughProviderState ? "state passthrough" : "cleaning on") + '</span></div>' +
             '<div class="row-actions">' +
               '<button class="secondary" onclick="onlyDeployment(' + index + ')">Only This</button>' +
               '<button class="secondary" ' + (testing ? "disabled" : "") + ' onclick="testDeployment(' + index + ')">' + (testing ? "Testing..." : "Test") + '</button>' +
@@ -1846,6 +1885,7 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
             '<div class="field"><label>id</label>' + input(item.id || "", "setDeployment(" + index + ", 'id', this.value)") + '</div>' +
             '<div class="field"><label>priority</label>' + slider(item.priority ?? 100, "setDeployment(" + index + ", 'priority', this.value)", 1, 100) + '<div class="hint">smaller runs first</div></div>' +
             '<div class="field"><label>weight</label>' + slider(item.weight ?? 1, "setDeployment(" + index + ", 'weight', this.value)", 1, 20) + '<div class="hint">same priority share</div></div>' +
+            '<div class="field"><label>provider state</label>' + checkboxRow(passthroughProviderState, "setDeploymentCompatibility(" + index + ", 'passthrough_provider_state', this.checked, true)", "Preserve state") + '<div class="hint">no item cleaning; keep one provider per session</div></div>' +
             '<div class="field"><label>tokens</label><div class="token">' + formatTokens(usage) + '</div><div class="hint">' + formatInteger(usage.requests || 0) + ' successful calls</div></div>' +
             '<div class="field"><label>last model</label><div class="mono">' + escapeHtml(last?.upstream_model || "-") + '</div><div class="hint">' + formatTime(last?.at) + '</div></div>' +
           '</div>' +
@@ -2278,6 +2318,7 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     };
 
     window.setDeployment = setDeployment;
+    window.setDeploymentCompatibility = setDeploymentCompatibility;
     window.testDeployment = (index) => runDeploymentTest(index).catch((error) => notice(error.message, "bad"));
     window.hardTestDeployment = (index) => runDeploymentTest(index, "hard").catch((error) => notice(error.message, "bad"));
     window.onlyDeployment = onlyDeployment;

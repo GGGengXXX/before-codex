@@ -42,10 +42,12 @@ import {
   sseHasDoneMarker,
   sseHasTerminalEvent,
   synthesizeResponseCompletedSse,
+  synthesizeResponseSseFromJson,
   synthesizeResponseFailedSse
 } from "./upstream.js";
 import { renderAdminPage } from "./admin-page.js";
 import { renderMobilePage } from "./mobile-page.js";
+import { relayIconSvg } from "./relay-icon.js";
 import { renderStatusPage } from "./status-page.js";
 
 const execFileAsync = promisify(execFile);
@@ -820,6 +822,16 @@ function clientDisconnectedError() {
 }
 
 function forwardResponse(res, upstream, bodyTextValue, requestIdValue, compatibility = {}, requestBody = null) {
+  if (compatibility?.passthrough_provider_state === true) {
+    res.writeHead(upstream.status, {
+      ...responseHeaders(upstream),
+      "content-length": Buffer.byteLength(bodyTextValue),
+      "x-relay-request-id": requestIdValue
+    });
+    res.end(bodyTextValue);
+    return;
+  }
+
   let payload = bodyTextValue;
   try {
     payload = sanitizeResponsePayload(JSON.parse(bodyTextValue), compatibility, requestIdValue, requestBody);
@@ -833,6 +845,35 @@ function forwardResponse(res, upstream, bodyTextValue, requestIdValue, compatibi
     "x-relay-request-id": requestIdValue
   });
   res.end(body);
+}
+
+function responsePayloadForCompletedEvent(value) {
+  if (value?.response && typeof value.response === "object") {
+    return value.response;
+  }
+  return value && typeof value === "object" ? value : null;
+}
+
+function stringifiedOrDirectSseBody(text) {
+  if (typeof text !== "string") {
+    return null;
+  }
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith("event: ") || trimmed.startsWith("data: ")) {
+    return text;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed !== "string") {
+      return null;
+    }
+    const parsedTrimmed = parsed.trimStart();
+    return parsedTrimmed.startsWith("event: ") || parsedTrimmed.startsWith("data: ")
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function nearRequestTimeout(elapsedMs, timeoutMs) {
@@ -971,16 +1012,18 @@ async function relayResponses({
     state.recordAttempt(deployment);
     const upstreamModel = deployment.model;
     const compatibility = compatibilityForDeployment(config, deployment);
+    const streamViaNonStream = stream && compatibility.stream_via_non_stream === true;
+    const upstreamRequestBody = streamViaNonStream ? { ...body, stream: false } : body;
 
     let upstreamCall = null;
     try {
       upstreamCall = await callUpstream({
         request: req,
         response: res,
-        body,
+        body: upstreamRequestBody,
         deployment,
         compatibility,
-        stream,
+        stream: !streamViaNonStream && stream,
         timeoutMs: config.server.request_timeout_ms
       });
       const upstream = upstreamCall.response;
@@ -1021,6 +1064,87 @@ async function relayResponses({
             return;
           }
           continue;
+        }
+
+        if (streamViaNonStream) {
+          const responseBody = await readText(upstream, config.server.max_body_bytes);
+          attemptInfo.result = "success";
+          const rawCapture = await captureRawResponse(rawStore, logger, {
+            requestIdValue,
+            storageId: requestIdValue + "-attempt-" + (attemptNumber + 1),
+            bodyText: responseBody,
+            contentType: upstream.headers.get("content-type") || "",
+            stream: false
+          });
+          let responseStream = null;
+          let responseText = "";
+          let responseUsage = null;
+          const sseBody = stringifiedOrDirectSseBody(responseBody);
+          if (sseBody && (sseHasTerminalEvent(sseBody) || sseHasDoneMarker(sseBody))) {
+            responseStream = sseBody;
+            const parts = extractOutputTextPartsFromSse(sseBody);
+            responseText = parts.deltaText
+              || parts.itemText
+              || parts.completedText
+              || extractOutputTextFromSse(sseBody);
+            responseUsage = extractUsageFromSse(sseBody);
+            state.setAffinity(
+              extractResponseIdFromSse(sseBody),
+              deployment.id,
+              config.routing.affinity_ttl_ms ?? 86400000
+            );
+          } else {
+            let telemetryPayload = null;
+            try {
+              const parsed = JSON.parse(responseBody);
+              telemetryPayload = sanitizeResponsePayload(parsed, compatibility, requestIdValue, body);
+              state.setAffinity(
+                extractResponseIdFromJson(telemetryPayload),
+                deployment.id,
+                config.routing.affinity_ttl_ms ?? 86400000
+              );
+            } catch {
+              telemetryPayload = null;
+            }
+            responseText = extractOutputTextFromJson(telemetryPayload);
+            responseUsage = extractUsageFromJson(telemetryPayload);
+            responseStream = synthesizeResponseSseFromJson({
+              response: responsePayloadForCompletedEvent(telemetryPayload),
+              responseId: extractResponseIdFromJson(telemetryPayload),
+              requestId: requestIdValue,
+              outputText: responseText,
+              usage: responseUsage
+            });
+          }
+          state.recordSuccess(deployment, {
+            request_id: requestIdValue,
+            requested_model: requestedModel,
+            logical_model: resolved.name,
+            upstream_model: upstreamModel,
+            request_text: requestTextFromBody(body),
+            usage: responseUsage,
+            response_text: responseText,
+            duration_ms: Date.now() - attemptStartedAt,
+            thread_id: threadId,
+            rollout_path: rolloutPath,
+            raw_response_id: rawCapture?.id,
+            raw_response_path: rawCapture?.path,
+            raw_response_bytes: rawCapture?.bytes
+          });
+          logger("info", "upstream_non_stream_success_for_stream_client", {
+            request_id: requestIdValue,
+            deployment: deployment.id,
+            provider: deployment.provider,
+            model: upstreamModel,
+            duration_ms: Date.now() - attemptStartedAt
+          });
+          res.writeHead(upstream.status, {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache",
+            "x-relay-request-id": requestIdValue
+          });
+          res.end(responseStream);
+          return;
         }
 
         if (!stream) {
@@ -2147,6 +2271,15 @@ export function createRelayServer(
           "content-length": Buffer.byteLength(html)
         });
         res.end(html);
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/favicon.svg") {
+        res.writeHead(200, {
+          "content-type": "image/svg+xml; charset=utf-8",
+          "content-length": Buffer.byteLength(relayIconSvg),
+          "cache-control": "public, max-age=604800, immutable"
+        });
+        res.end(relayIconSvg);
         return;
       }
       if (req.method === "GET" && url.pathname === "/admin") {
