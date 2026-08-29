@@ -24,6 +24,7 @@ import { RuntimeState, createRuntimeState } from "../src/state.js";
 import {
   extractOutputTextFromSse,
   extractOutputTextPartsFromSse,
+  responseHeaders,
   sseHasDoneMarker,
   sseHasTerminalEvent,
   synthesizeResponseSseFromJson
@@ -263,6 +264,23 @@ test("classifies quota errors as key-level failover", () => {
   assert.equal(classification.kind, "billing_or_quota");
   assert.equal(classification.rotateKey, true);
   assert.equal(classification.retryable, true);
+});
+
+test("strips hop-by-hop and decoded-body headers from upstream responses", () => {
+  const headers = responseHeaders({
+    headers: new Headers({
+      "content-type": "application/json",
+      "content-encoding": "gzip",
+      "content-length": "123",
+      "transfer-encoding": "chunked",
+      "connection": "keep-alive",
+      "x-upstream-request-id": "req-test"
+    })
+  });
+  assert.deepEqual(headers, {
+    "content-type": "application/json",
+    "x-upstream-request-id": "req-test"
+  });
 });
 
 test("recognizes terminal Responses SSE events", () => {

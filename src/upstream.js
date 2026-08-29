@@ -526,7 +526,13 @@ export async function callUpstream({
 export function responseHeaders(upstream) {
   const headers = {};
   for (const [name, value] of upstream.headers) {
-    if (!["connection", "keep-alive", "transfer-encoding", "content-length"].includes(name)) {
+    if (![
+      "connection",
+      "keep-alive",
+      "transfer-encoding",
+      "content-length",
+      "content-encoding"
+    ].includes(name)) {
       headers[name] = value;
     }
   }
