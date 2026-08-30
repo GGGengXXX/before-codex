@@ -21,6 +21,7 @@ import {
 import { ensureEnvValues, loadEnvFile, parseEnv } from "../src/env.js";
 import { createRelayServer } from "../src/server.js";
 import { RuntimeState, createRuntimeState } from "../src/state.js";
+import { readCodexConfig, writeCodexConfig } from "../src/codex-config.js";
 import {
   extractOutputTextFromSse,
   extractOutputTextPartsFromSse,
@@ -4522,8 +4523,55 @@ test("admin codex config endpoint switches between openai and relay", async () =
         .stdout.trim(),
       "openai"
     );
+
+    const permissionsResult = await httpRequest(
+      relayPort,
+      "/admin/codex-config",
+      "POST",
+      {
+        approval_policy: "never",
+        sandbox_mode: "workspace-write",
+        network_access: true
+      },
+      { authorization: "Bearer admin-secret" }
+    );
+    assert.equal(permissionsResult.status, 200);
+    assert.deepEqual(
+      {
+        approval_policy: JSON.parse(permissionsResult.body).codex.approval_policy,
+        sandbox_mode: JSON.parse(permissionsResult.body).codex.sandbox_mode,
+        network_access: JSON.parse(permissionsResult.body).codex.network_access
+      },
+      { approval_policy: "never", sandbox_mode: "workspace-write", network_access: true }
+    );
+    const savedCodex = await fs.readFile(codexConfigPath, "utf8");
+    assert.match(savedCodex, /^approval_policy = "never"/m);
+    assert.match(savedCodex, /^sandbox_mode = "workspace-write"/m);
+    assert.match(savedCodex, /^\[sandbox_workspace_write\]\s*\nnetwork_access = true/m);
   } finally {
     await close(relay);
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Codex permission updates only touch top-level settings", async () => {
+  const directory = await temporaryDirectory();
+  const configPath = path.join(directory, "codex.toml");
+  await fs.writeFile(configPath, [
+    'approval_policy = "on-request"',
+    "[profiles.dev]",
+    'approval_policy = "untrusted"',
+    "[sandbox_workspace_write]",
+    "network_access = false",
+    ""
+  ].join("\n"));
+  try {
+    await writeCodexConfig({ approvalPolicy: "never", configPath });
+    const content = await fs.readFile(configPath, "utf8");
+    assert.match(content, /^approval_policy = "never"/m);
+    assert.match(content, /\[profiles\.dev\]\napproval_policy = "untrusted"/m);
+    assert.equal((await readCodexConfig(configPath)).approval_policy, "never");
+  } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
 });

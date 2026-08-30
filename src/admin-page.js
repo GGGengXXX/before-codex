@@ -628,6 +628,34 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
         </div>
         <div class="divider"></div>
         <div class="section-title">
+          <h2>Codex Permissions</h2>
+          <span id="codex-approval-state" class="pill">unknown</span>
+        </div>
+        <div class="field">
+          <label for="codex-approval-policy">Approval policy</label>
+          <select id="codex-approval-policy">
+            <option value="never">never · no confirmation</option>
+            <option value="on-request">on-request</option>
+            <option value="on-failure">on-failure</option>
+            <option value="untrusted">untrusted</option>
+          </select>
+          <div class="hint">Applies to all new Codex conversations using this config.</div>
+        </div>
+        <div class="field" style="margin-top:10px">
+          <label for="codex-sandbox-mode">Sandbox mode</label>
+          <select id="codex-sandbox-mode">
+            <option value="workspace-write">workspace-write</option>
+            <option value="read-only">read-only</option>
+            <option value="danger-full-access">danger-full-access</option>
+          </select>
+        </div>
+        <label class="checkbox-row" style="margin-top:10px">
+          <input id="codex-network-access" type="checkbox">
+          Allow network access in workspace-write
+        </label>
+        <button id="apply-codex-permissions" class="secondary" style="margin-top:10px">Apply Permissions</button>
+        <div class="divider"></div>
+        <div class="section-title">
           <h2>Secrets</h2>
           <button id="save-secrets" class="secondary">Save</button>
         </div>
@@ -750,6 +778,7 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     let config = null;
     let selectedModel = "";
     let selectedProvider = "";
+    let codexPermissions = { approval_policy: "never", sandbox_mode: "workspace-write", network_access: false };
     let view = "quick";
     const scopeQuery = new URLSearchParams(location.search).get("session") || "";
     let scopeMode = ["global", "terminal"].includes(localStorage.getItem("codexRelayScopeMode") || "")
@@ -1686,8 +1715,18 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     function renderCodex(codex) {
       const current = codex?.model_provider || "openai";
       selectedProvider = selectedProvider || current;
+      codexPermissions = {
+        approval_policy: codex?.approval_policy || codexPermissions.approval_policy || "never",
+        sandbox_mode: codex?.sandbox_mode || codexPermissions.sandbox_mode || "workspace-write",
+        network_access: codex?.network_access === true
+      };
       $("codex-state").textContent = current;
       $("codex-state").className = "pill " + (current === "relay" ? "on" : "");
+      $("codex-approval-state").textContent = codexPermissions.approval_policy;
+      $("codex-approval-state").className = "pill " + (codexPermissions.approval_policy === "never" ? "on" : "");
+      $("codex-approval-policy").value = codexPermissions.approval_policy;
+      $("codex-sandbox-mode").value = codexPermissions.sandbox_mode;
+      $("codex-network-access").checked = codexPermissions.network_access;
       $("provider-openai").classList.toggle("active", selectedProvider === "openai");
       $("provider-relay").classList.toggle("active", selectedProvider === "relay");
     }
@@ -2006,6 +2045,20 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
       return payload.codex;
     }
 
+    async function applyCodexPermissions() {
+      const payload = await api("/admin/codex-config", {
+        method: "POST",
+        body: JSON.stringify({
+          approval_policy: $("codex-approval-policy").value,
+          sandbox_mode: $("codex-sandbox-mode").value,
+          network_access: $("codex-network-access").checked
+        })
+      });
+      renderCodex(payload.codex);
+      notice("Codex permissions saved · restart Codex conversations to pick up changes", "good");
+      return payload.codex;
+    }
+
     async function save(options = {}) {
       syncConfigFromEditor();
       const body = { config };
@@ -2292,6 +2345,9 @@ export function renderAdminPage({ bootstrapAdminToken = "", canShutdown = false 
     };
     $("apply-provider").onclick = () => runButtonAction("apply-provider", "Applying...", applyProvider, {
       progress: "Updating Codex provider and thread state..."
+    });
+    $("apply-codex-permissions").onclick = () => runButtonAction("apply-codex-permissions", "Applying...", applyCodexPermissions, {
+      progress: "Updating Codex approval and sandbox policy..."
     });
     $("quick-tab").onclick = () => {
       view = "quick";

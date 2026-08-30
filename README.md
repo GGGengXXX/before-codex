@@ -167,10 +167,17 @@ curl -X POST http://127.0.0.1:8787/admin/reload \
 
 推荐在管理控制台左侧的 `Codex Provider` 里切换 `openai` 或 `relay`。切到 `relay` 时，服务会自动写入 `~/.codex/config.toml`。本地 auth command 会优先读取当前终端的多用户 session，其次读取免登录默认账号；没有注册账号时才从 `.env` 读取旧版内部 relay token。
 
+管理控制台的 `Codex Permissions` 可以为本机所有 Codex 对话写入全局执行策略。日常开发可选择 `approval_policy = "never"`、`sandbox_mode = "workspace-write"`，这样 Codex 会在工作区内自动读写和执行命令，不再逐条弹出确认；网络访问仍需单独打开。配置修改后需要重新启动 Codex 会话才能生效。
+
 网页端生成的配置类似这样：
 
 ```toml
 model_provider = "relay"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = false
 
 [model_providers.relay]
 name = "Codex Relay"

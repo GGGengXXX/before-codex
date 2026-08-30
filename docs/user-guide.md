@@ -100,6 +100,8 @@ http://电脑局域网IP:8787/mobile
 
 `Quick` 页保留一次性任务，默认执行后端是 `codex app-server --stdio`，页面里的 `Backend` 也可以切回 `exec` fallback。默认同一用户同时只允许 1 个一次性 Codex run。默认 `app_server_approval_policy` 是 `never`，手机端会少看到审批提示；如果改成 `on-request`，app-server 发出的命令或文件变更审批会出现在手机详情区。
 
+电脑端 `/admin` 的 `Codex Permissions` 用于修改本机 `~/.codex/config.toml` 的全局 `approval_policy`、`sandbox_mode` 和 `sandbox_workspace_write.network_access`。选择 `never + workspace-write` 可让所有新 Codex 对话免确认地在当前工作区执行；该设置不替代沙箱限制，改动后请重新启动 Codex 会话。
+
 ## 快速开始
 
 ### 1. 准备配置文件

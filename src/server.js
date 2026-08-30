@@ -13,7 +13,7 @@ import {
   defaultCodexStatePath,
   readCodexConfig,
   relayTokenAuthCommand,
-  writeCodexModelProvider
+  writeCodexConfig
 } from "./codex-config.js";
 import {
   envReferences,
@@ -2931,8 +2931,11 @@ export function createRelayServer(
         }
         const body = await readRequestBody(req, config.server.max_body_bytes);
         try {
-          const codex = await writeCodexModelProvider({
+          const codex = await writeCodexConfig({
             modelProvider: body.model_provider,
+            approvalPolicy: body.approval_policy,
+            sandboxMode: body.sandbox_mode,
+            networkAccess: body.network_access,
             relayBaseUrl: body.relay_base_url || relayBaseUrl(context.config),
             authCommand: body.auth_command === undefined
               ? relayTokenAuthCommand(envPath)
